@@ -13,7 +13,8 @@ interface GmailMessagesApi {
     labelIds?: string[];
     maxResults?: number;
     q?: string;
-  }): Promise<{ data?: { messages?: MessageSummary[]; resultSizeEstimate?: number | null } }>;
+    pageToken?: string;
+  }): Promise<{ data?: { messages?: MessageSummary[]; resultSizeEstimate?: number | null; nextPageToken?: string | null } }>;
   get(args: {
     userId: string;
     id: string;
@@ -149,12 +150,14 @@ export class GoogleapisGmailClient implements GmailApiClient {
     labelIds?: string[];
     maxResults?: number;
     q?: string;
-  }): Promise<{ messages?: Array<{ id: string; threadId: string }>; resultSizeEstimate?: number }> {
+    pageToken?: string;
+  }): Promise<{ messages?: Array<{ id: string; threadId: string }>; resultSizeEstimate?: number; nextPageToken?: string }> {
     const response = await this.api.users.messages.list({
       userId: 'me',
       labelIds: opts.labelIds,
       maxResults: opts.maxResults,
       q: opts.q,
+      ...(opts.pageToken ? { pageToken: opts.pageToken } : {}),
     });
 
     return {
@@ -162,6 +165,7 @@ export class GoogleapisGmailClient implements GmailApiClient {
         ?.filter((message): message is { id: string; threadId: string } => !!message.id && !!message.threadId)
         .map(message => ({ id: message.id, threadId: message.threadId })),
       resultSizeEstimate: response.data?.resultSizeEstimate ?? undefined,
+      ...(response.data?.nextPageToken ? { nextPageToken: response.data.nextPageToken } : {}),
     };
   }
 

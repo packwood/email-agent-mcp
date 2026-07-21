@@ -34,7 +34,7 @@ const DRAFT_ORIGIN_HEADER = 'X-Agent-Draft-Origin';
 type DraftOrigin = 'reply' | 'non_reply';
 
 export interface GmailApiClient {
-  listMessages(opts: { labelIds?: string[]; maxResults?: number; q?: string }): Promise<{ messages?: Array<{ id: string; threadId: string }>; resultSizeEstimate?: number }>;
+  listMessages(opts: { labelIds?: string[]; maxResults?: number; q?: string; pageToken?: string }): Promise<{ messages?: Array<{ id: string; threadId: string }>; resultSizeEstimate?: number; nextPageToken?: string }>;
   getMessage(id: string): Promise<GmailMessage>;
   getDraft(draftId: string): Promise<{ id: string; message: GmailMessage }>;
   getAttachment(messageId: string, attachmentId: string): Promise<{ data?: string; size?: number }>;
@@ -96,14 +96,8 @@ export class GmailEmailProvider {
     const limit = opts.limit ?? 25;
     const offset = opts.offset ?? 0;
 
-    const response = await this.client.listMessages({
-      labelIds: [label],
-      maxResults: offset + limit,
-    });
-
-    if (!response.messages?.length) return [];
-
-    const page = response.messages.slice(offset);
+    const page = await this.listMessageWindow({ labelIds: [label] }, offset, limit);
+    if (page.length === 0) return [];
     const messages = await Promise.all(
       page.map(m => this.client.getMessage(m.id)),
     );
@@ -122,14 +116,38 @@ export class GmailEmailProvider {
   }
 
   async searchMessages(query: string, _folder?: string, limit?: number, offset?: number): Promise<EmailMessage[]> {
-    const response = await this.client.listMessages({ q: query, maxResults: (offset ?? 0) + (limit ?? 50) });
-    if (!response.messages?.length) return [];
-
-    const page = response.messages.slice(offset ?? 0);
+    const page = await this.listMessageWindow({ q: query }, offset ?? 0, limit ?? 50);
+    if (page.length === 0) return [];
     const messages = await Promise.all(
       page.map(m => this.client.getMessage(m.id)),
     );
     return messages.map(m => mapGmailMessage(m));
+  }
+
+  private async listMessageWindow(
+    opts: { labelIds?: string[]; q?: string },
+    offset: number,
+    limit: number,
+  ): Promise<Array<{ id: string; threadId: string }>> {
+    const target = offset + limit;
+    const collected: Array<{ id: string; threadId: string }> = [];
+    const visitedTokens = new Set<string>();
+    let pageToken: string | undefined;
+
+    while (collected.length < target) {
+      const response = await this.client.listMessages({
+        ...opts,
+        maxResults: Math.min(500, Math.max(1, target - collected.length)),
+        ...(pageToken ? { pageToken } : {}),
+      });
+      collected.push(...(response.messages ?? []));
+      const next = response.nextPageToken;
+      if (!next || visitedTokens.has(next)) break;
+      visitedTokens.add(next);
+      pageToken = next;
+    }
+
+    return collected.slice(offset, target);
   }
 
   async getThread(messageId: string): Promise<EmailThread> {

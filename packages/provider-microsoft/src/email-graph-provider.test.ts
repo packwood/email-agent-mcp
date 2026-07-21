@@ -437,6 +437,38 @@ describe('provider-microsoft/Attachment Download', () => {
     );
   });
 
+  it('follows every attachment collection page', async () => {
+    const client = createSchemaValidatingClient([
+      {
+        value: [{ id: 'att-1', name: 'one.txt', contentType: 'text/plain', size: 1 }],
+        '@odata.nextLink': 'https://graph.microsoft.com/v1.0/me/messages/msg-1/attachments?page=2',
+      },
+      {
+        value: [{ id: 'att-2', name: 'two.txt', contentType: 'text/plain', size: 2 }],
+      },
+    ]);
+    const provider = new GraphEmailProvider(client);
+
+    const attachments = await provider.listAttachments('msg-1');
+
+    expect(attachments.map(attachment => attachment.id)).toEqual(['att-1', 'att-2']);
+    expect(client.get).toHaveBeenNthCalledWith(
+      2,
+      'https://graph.microsoft.com/v1.0/me/messages/msg-1/attachments?page=2',
+    );
+  });
+
+  it('fails instead of returning a partial attachment collection on a looping nextLink', async () => {
+    const loop = 'https://graph.microsoft.com/v1.0/me/messages/msg-1/attachments?page=loop';
+    const client = createSchemaValidatingClient([
+      { value: [], '@odata.nextLink': loop },
+      { value: [], '@odata.nextLink': loop },
+    ]);
+    const provider = new GraphEmailProvider(client);
+
+    await expect(provider.listAttachments('msg-1')).rejects.toThrow(/pagination did not terminate/);
+  });
+
   it('Scenario: downloadAttachment decodes contentBytes and uses the fileAttachment $select cast', async () => {
     const PAYLOAD = Buffer.from('hello world from a test attachment');
     const client = createSchemaValidatingClient([

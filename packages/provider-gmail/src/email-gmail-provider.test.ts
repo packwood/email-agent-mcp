@@ -337,6 +337,55 @@ describe('provider-gmail/Label Mapping', () => {
   });
 });
 
+describe('provider-gmail/Pagination', () => {
+  it('follows page tokens until an offset window is complete', async () => {
+    const listMessages = vi.fn()
+      .mockResolvedValueOnce({
+        messages: [
+          { id: 'm-1', threadId: 't-1' },
+          { id: 'm-2', threadId: 't-2' },
+        ],
+        nextPageToken: 'page-2',
+      })
+      .mockResolvedValueOnce({
+        messages: [
+          { id: 'm-3', threadId: 't-3' },
+          { id: 'm-4', threadId: 't-4' },
+        ],
+      });
+    const client = createMockGmailClient({
+      listMessages,
+      getMessage: vi.fn().mockImplementation(async (id: string) => ({
+        id,
+        threadId: `t-${id.slice(2)}`,
+        labelIds: ['INBOX'],
+        payload: {
+          headers: [
+            { name: 'From', value: 'sender@example.com' },
+            { name: 'Subject', value: id },
+            { name: 'Date', value: '2026-07-21T12:00:00Z' },
+          ],
+        },
+        internalDate: String(new Date('2026-07-21T12:00:00Z').getTime()),
+      })),
+    });
+    const provider = new GmailEmailProvider(client);
+
+    const messages = await provider.searchMessages('participant@example.com', undefined, 2, 2);
+
+    expect(messages.map(message => message.id)).toEqual(['m-3', 'm-4']);
+    expect(listMessages).toHaveBeenNthCalledWith(1, {
+      q: 'participant@example.com',
+      maxResults: 4,
+    });
+    expect(listMessages).toHaveBeenNthCalledWith(2, {
+      q: 'participant@example.com',
+      maxResults: 2,
+      pageToken: 'page-2',
+    });
+  });
+});
+
 describe('provider-gmail/Draft Operations', () => {
   it('Scenario: createDraft sends raw message to Gmail API', async () => {
     const client = createMockGmailClient();

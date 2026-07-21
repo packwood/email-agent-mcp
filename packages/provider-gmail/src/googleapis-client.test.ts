@@ -71,6 +71,29 @@ describe('provider-gmail/GoogleapisGmailClient', () => {
     });
   });
 
+  it('forwards and returns Gmail page tokens', async () => {
+    const api = createMockApi();
+    api.users.messages.list.mockResolvedValueOnce({
+      data: {
+        messages: [{ id: 'm-2', threadId: 't-2' }],
+        resultSizeEstimate: 2,
+        nextPageToken: 'page-3',
+      },
+    });
+    const client = createClient(api);
+
+    const result = await client.listMessages({ maxResults: 1, pageToken: 'page-2' });
+
+    expect(api.users.messages.list).toHaveBeenCalledWith({
+      userId: 'me',
+      labelIds: undefined,
+      maxResults: 1,
+      q: undefined,
+      pageToken: 'page-2',
+    });
+    expect(result.nextPageToken).toBe('page-3');
+  });
+
   it('Scenario: getMessage requests full Gmail payload', async () => {
     const api = createMockApi();
     const client = createClient(api);

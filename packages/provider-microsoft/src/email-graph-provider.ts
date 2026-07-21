@@ -498,10 +498,21 @@ export class GraphEmailProvider implements EmailReader, EmailSender, EmailSchedu
   // want metadata without bytes (e.g. `list_attachments`); downloadAttachment
   // does its own single-call fetch and does not preflight through this method.
   async listAttachments(messageId: string): Promise<EmailAttachment[]> {
-    const response = await this.client.get(
-      `${this.basePath}/messages/${encodeGraphPathId(messageId)}/attachments?$select=${ATTACHMENT_SELECT}`,
-    );
-    return ((response.value ?? []) as GraphAttachment[]).map(a => ({
+    const attachments: GraphAttachment[] = [];
+    const visitedUrls = new Set<string>();
+    const maxPages = 100;
+    let url: string | undefined =
+      `${this.basePath}/messages/${encodeGraphPathId(messageId)}/attachments?$select=${ATTACHMENT_SELECT}`;
+    while (url) {
+      if (visitedUrls.size >= maxPages || visitedUrls.has(url)) {
+        throw new Error(`Attachment pagination did not terminate for message ${messageId}`);
+      }
+      visitedUrls.add(url);
+      const response = await this.client.get(url) as { value?: GraphAttachment[]; '@odata.nextLink'?: string };
+      attachments.push(...(response.value ?? []));
+      url = response['@odata.nextLink'];
+    }
+    return attachments.map(a => ({
       id: a.id,
       filename: a.name ?? '',
       mimeType: a.contentType ?? 'application/octet-stream',
