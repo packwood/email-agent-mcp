@@ -25,6 +25,7 @@ import type {
   ScheduledSendResult,
   EmailScheduledSender,
   DraftReplyStatus,
+  SearchProviderOptions,
 } from '@usejunior/email-core';
 import { AttachmentNotSupportedError, AttachmentNotFoundError, ProviderError } from '@usejunior/email-core';
 
@@ -420,7 +421,13 @@ export class GraphEmailProvider implements EmailReader, EmailSender, EmailSchedu
     };
   }
 
-  async searchMessages(query: string, folder?: string, limit?: number, offset?: number): Promise<EmailMessage[]> {
+  async searchMessages(
+    query: string,
+    folder?: string,
+    limit?: number,
+    offset?: number,
+    options?: SearchProviderOptions,
+  ): Promise<EmailMessage[]> {
     if (!query || !query.trim()) return [];
 
     const params = new URLSearchParams();
@@ -437,7 +444,7 @@ export class GraphEmailProvider implements EmailReader, EmailSender, EmailSchedu
       return ((response.value ?? []) as GraphMessage[]).map(mapGraphMessage);
     } catch (err) {
       // On HTTP 400 (syntax error), retry with simplified keywords
-      if (err instanceof GraphApiError && err.status === 400) {
+      if (!options?.strict && err instanceof GraphApiError && err.status === 400) {
         const simplified = simplifySearchQuery(query);
         if (simplified && simplified !== query) {
           const retryParams = new URLSearchParams();

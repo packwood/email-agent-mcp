@@ -29,6 +29,7 @@ export type {
   CreateInboxRule,
   EmailRuleManager,
   DownloadedAttachment,
+  SearchProviderOptions,
   EmailProvider,
   AuthManager,
   DraftReplyStatus,

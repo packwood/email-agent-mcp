@@ -2245,6 +2245,21 @@ describe('provider-microsoft/Search Hardening', () => {
     expect(retryUrl).not.toContain('AND');
   });
 
+  it('Scenario: Strict search fails closed instead of silently broadening', async () => {
+    const error = new GraphApiError(400, 'Bad Request: syntax error');
+    const client = createMockClient({ get: vi.fn().mockRejectedValue(error) });
+    const provider = new GraphEmailProvider(client);
+
+    await expect(provider.searchMessages(
+      'participants:(Nala) AND received>=2026-07-14',
+      undefined,
+      25,
+      0,
+      { strict: true },
+    )).rejects.toBe(error);
+    expect(client.get).toHaveBeenCalledTimes(1);
+  });
+
   it('Scenario: simplifySearchQuery strips prefixes and operators', () => {
     expect(simplifySearchQuery('from:alice@corp.com AND subject:"Q4 budget"'))
       .toBe('alice@corp.com Q4 budget');

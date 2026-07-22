@@ -1,12 +1,24 @@
 // MCP server — thin transport adapter mapping action registry to MCP tools
 import { createRequire } from 'node:module';
-import type { DeletePolicy, EmailAction, EmailMessage, EmailProvider } from '@usejunior/email-core';
+import type { DeletePolicy, EmailAction, EmailProvider } from '@usejunior/email-core';
 import {
   EmailDraftStatusSchema,
   EmailThreadFieldsSchema,
   getEmailDraftStatus,
   getEmailThreadFields,
 } from '@usejunior/email-core';
+import {
+  SEARCH_SCOPES,
+  boundedSnippet,
+  buildProviderSearchQuery,
+  canonicalEffectiveQuery,
+  classifyMatch,
+  compareSearchMessages,
+  formatAddress,
+  inReceivedWindow,
+  matchesScope,
+  type DeterministicSearchInput,
+} from './search-contract.js';
 import { z } from 'zod';
 
 /**
@@ -71,6 +83,11 @@ const MANUAL_GMAIL_SETUP_HINT =
   'or add a Gmail mailbox JSON file under ~/.email-agent-mcp/tokens/. See packages/provider-gmail/README.md';
 const NO_MAILBOX_CONFIGURED_MESSAGE =
   `No mailbox configured — run: email-agent-mcp configure --mailbox <name> --provider microsoft ${MANUAL_GMAIL_SETUP_HINT}`;
+const ISO_TIMESTAMP = z.string().refine(
+  value => Number.isFinite(Date.parse(value)) && /(?:Z|[+-]\d{2}:\d{2})$/.test(value),
+  'must be an ISO-8601 timestamp with an explicit UTC offset',
+);
+const MAX_SEARCH_CANDIDATES = 1000;
 
 // Re-export types for the action registry
 export interface McpTool {
@@ -948,53 +965,160 @@ export async function buildLazyActions(
     },
     {
       name: 'search_emails',
-      description: 'Search emails using full-text query across one or all mailboxes. Use offset for pagination. Results include unsent drafts: a row with `isDraft: true` has NOT been sent — its `receivedAt` is provider-supplied metadata, not evidence of delivery. Never describe such a row as a sent, delivered, or received email.',
-      input: z.object({ query: z.string(), mailbox: z.string().nullable().optional(), limit: z.number().optional(), offset: z.number().optional() }),
+      description: 'Search emails deterministically using provider-native discovery, explicit received-time bounds, stable ordering, pagination metadata, and optional observable match evidence. Results can include unsent drafts: `isDraft: true` means the message has NOT been sent.',
+      input: z.object({
+        query: z.string(),
+        mailbox: z.string().nullable().optional(),
+        limit: z.number().optional(),
+        offset: z.number().optional(),
+        received_after: ISO_TIMESTAMP.optional(),
+        received_before: ISO_TIMESTAMP.optional(),
+        search_scope: z.enum(SEARCH_SCOPES).optional(),
+        verify_matches: z.boolean().optional(),
+      }),
       output: z.object({
         emails: z.array(z.object({
           id: z.string(),
           subject: z.string(),
           from: z.string(),
+          to: z.array(z.string()),
+          cc: z.array(z.string()),
+          bcc: z.array(z.string()),
           receivedAt: z.string(),
           isRead: z.boolean(),
           hasAttachments: z.boolean(),
           mailbox: z.string().optional(),
+          snippet: z.string().optional(),
+          matchClassification: z.enum([
+            'verified-header',
+            'verified-visible-body',
+            'unexplained-provider-hit',
+          ]).optional(),
+          matchedFields: z.array(z.string()).optional(),
         }).extend(EmailThreadFieldsSchema.shape).extend(EmailDraftStatusSchema.shape)),
+        returnedCount: z.number(),
+        isTruncated: z.boolean(),
+        nextOffset: z.number().optional(),
+        candidateLimitReached: z.boolean(),
+        effectiveQuery: z.string(),
       }),
       annotations: { readOnlyHint: true, destructiveHint: false },
       run: async (_ctx, input) => {
         await waitForInit(state);
-        if (!getDefaultMailbox(state)) return { emails: [] };
-        const inp = input as { query: string; mailbox?: string | null; limit?: number; offset?: number };
+        const inp = input as {
+          query: string;
+          mailbox?: string | null;
+          limit?: number;
+          offset?: number;
+          received_after?: string;
+          received_before?: string;
+          search_scope?: typeof SEARCH_SCOPES[number];
+          verify_matches?: boolean;
+        };
+        const limit = inp.limit ?? 25;
+        const offset = inp.offset ?? 0;
+        const searchInput: DeterministicSearchInput = {
+          query: inp.query,
+          searchScope: inp.search_scope ?? 'any',
+          receivedAfter: inp.received_after,
+          receivedBefore: inp.received_before,
+        };
+        if (!searchInput.query?.trim()) throw new Error('SEARCH_QUERY_INVALID: query must not be empty');
+        for (const [name, value] of [
+          ['received_after', searchInput.receivedAfter],
+          ['received_before', searchInput.receivedBefore],
+        ] as const) {
+          if (value && (!Number.isFinite(Date.parse(value)) || !/(?:Z|[+-]\d{2}:\d{2})$/.test(value))) {
+            throw new Error(`SEARCH_WINDOW_INVALID: ${name} must include an explicit UTC offset`);
+          }
+        }
+        if (
+          searchInput.receivedAfter && searchInput.receivedBefore &&
+          Date.parse(searchInput.receivedAfter) >= Date.parse(searchInput.receivedBefore)
+        ) {
+          throw new Error('SEARCH_WINDOW_INVALID: received_after must precede received_before');
+        }
+        const emptyResult = {
+          emails: [],
+          returnedCount: 0,
+          isTruncated: false,
+          candidateLimitReached: false,
+          effectiveQuery: canonicalEffectiveQuery(searchInput),
+        };
+        if (!getDefaultMailbox(state)) return emptyResult;
         const resolved = inp.mailbox === null ? null : resolveMailboxContext(state, inp.mailbox);
-        const results: Array<EmailMessage & { mailbox: string }> = resolved
-          ? (await resolved.mailbox.provider.searchMessages(
-            inp.query,
-            undefined,
-            inp.limit ?? 25,
-            inp.offset,
-          )).map(result => ({ ...result, mailbox: resolved.mailbox.name }))
-          : (await Promise.all(
-            getConnectedMailboxes(state).map(async mailbox => {
-              const mailboxResults = await mailbox.provider.searchMessages(inp.query, undefined);
-              return mailboxResults.map(result => ({ ...result, mailbox: mailbox.name }));
-            }),
+        const mailboxes = resolved ? [resolved.mailbox] : getConnectedMailboxes(state);
+        let providerMayHaveMore = false;
+        const results = (await Promise.all(mailboxes.map(async mailbox => {
+          const providerQuery = buildProviderSearchQuery(mailbox.providerType, searchInput);
+          const targetCount = offset + limit + 1;
+          let fetchLimit = Math.min(MAX_SEARCH_CANDIDATES, Math.max(100, targetCount));
+          let mailboxResults = [];
+
+          // Provider-native search can surface candidates that exact local
+          // time/scope verification removes. Expand the prefix until there is
+          // a full deterministic page, the provider is exhausted, or Graph's
+          // documented 1,000-result search ceiling is reached.
+          while (true) {
+            mailboxResults = await mailbox.provider.searchMessages(
+              providerQuery,
+              undefined,
+              fetchLimit,
+              0,
+              { strict: true },
+            );
+            const verifiedCount = mailboxResults
+              .filter(message => inReceivedWindow(
+                message,
+                searchInput.receivedAfter,
+                searchInput.receivedBefore,
+              ))
+              .filter(message => matchesScope(message, searchInput.searchScope, searchInput.query))
+              .length;
+            const providerExhausted = mailboxResults.length < fetchLimit;
+            if (providerExhausted || verifiedCount >= targetCount || fetchLimit === MAX_SEARCH_CANDIDATES) {
+              providerMayHaveMore ||= !providerExhausted;
+              break;
+            }
+            fetchLimit = Math.min(MAX_SEARCH_CANDIDATES, fetchLimit * 2);
+          }
+          return mailboxResults.map(result => ({ ...result, mailbox: mailbox.name }));
+        }))).flat();
+        const filtered = results
+          .filter(message => inReceivedWindow(
+            message,
+            searchInput.receivedAfter,
+            searchInput.receivedBefore,
           ))
-            .flat()
-            .sort((a, b) => new Date(b.receivedAt).getTime() - new Date(a.receivedAt).getTime())
-            .slice(inp.offset ?? 0, (inp.offset ?? 0) + (inp.limit ?? 25));
+          .filter(message => matchesScope(message, searchInput.searchScope, searchInput.query))
+          .sort(compareSearchMessages);
+        const page = filtered.slice(offset, offset + limit);
+        const isTruncated = providerMayHaveMore || filtered.length > offset + page.length;
         return {
-          emails: results.map(m => ({
-            id: m.id,
-            subject: m.subject,
-            from: m.from.name ? `${m.from.name} <${m.from.email}>` : m.from.email,
-            receivedAt: m.receivedAt,
-            isRead: m.isRead,
-            hasAttachments: m.hasAttachments,
-            mailbox: m.mailbox,
-            ...getEmailThreadFields(m),
-            ...getEmailDraftStatus(m),
-          })),
+          emails: page.map(m => {
+            const snippet = boundedSnippet(m);
+            return {
+              id: m.id,
+              subject: m.subject,
+              from: formatAddress(m.from),
+              to: m.to.map(formatAddress),
+              cc: (m.cc ?? []).map(formatAddress),
+              bcc: (m.bcc ?? []).map(formatAddress),
+              receivedAt: m.receivedAt,
+              isRead: m.isRead,
+              hasAttachments: m.hasAttachments,
+              mailbox: m.mailbox,
+              ...(snippet ? { snippet } : {}),
+              ...(inp.verify_matches ? classifyMatch(m, searchInput.query) : {}),
+              ...getEmailThreadFields(m),
+              ...getEmailDraftStatus(m),
+            };
+          }),
+          returnedCount: page.length,
+          isTruncated,
+          ...(isTruncated && page.length > 0 ? { nextOffset: offset + page.length } : {}),
+          candidateLimitReached: providerMayHaveMore,
+          effectiveQuery: canonicalEffectiveQuery(searchInput),
         };
       },
     },
