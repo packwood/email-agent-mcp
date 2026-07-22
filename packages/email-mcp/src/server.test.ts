@@ -717,7 +717,6 @@ describe('mcp-transport/Lazy Provider State', () => {
       candidateLimitReached: false,
       canonicalQuery: 'scope=any; query="license"',
       providerQueries: [{ mailbox: 'personal', provider: 'gmail', query: 'license' }],
-      searchSnapshot: expect.any(String),
     });
   });
 
@@ -827,7 +826,6 @@ describe('mcp-transport/Lazy Provider State', () => {
         { mailbox: 'personal', provider: 'gmail', query: 'license' },
         { mailbox: 'work', provider: 'microsoft', query: 'license' },
       ],
-      searchSnapshot: expect.any(String),
     });
   });
 
@@ -989,6 +987,63 @@ describe('mcp-transport/Lazy Provider State', () => {
     expect(terminalCappedPage).toMatchObject({ candidateLimitReached: true, isTruncated: true });
     expect(terminalCappedPage).not.toHaveProperty('nextOffset');
     expect(searchMessages).toHaveBeenCalledTimes(2);
+    await expect(search.run({}, {
+      query: 'Other',
+      mailbox: 'work@example.com',
+      limit: 1,
+      offset: 1,
+      search_scope: 'all-visible',
+      search_snapshot: capped.searchSnapshot,
+    })).rejects.toThrow(/SEARCH_SNAPSHOT_INVALID/);
+    await expect(search.run({}, {
+      query: 'Nala',
+      mailbox: 'work@example.com',
+      limit: 1,
+      offset: 1,
+      search_scope: 'all-visible',
+      search_snapshot: '123e4567-e89b-42d3-a456-426614174000',
+    })).rejects.toThrow(/SEARCH_SNAPSHOT_INVALID/);
+
+    searchMessages.mockResolvedValueOnce([
+      {
+        id: 'large-a',
+        subject: 'Large result',
+        from: { email: 'sender@example.com' },
+        to: [], cc: [], bcc: [],
+        receivedAt: '2026-07-22T15:00:00.000Z',
+        isRead: true,
+        hasAttachments: false,
+        body: 'x'.repeat(9 * 1024 * 1024),
+      },
+      {
+        id: 'large-b',
+        subject: 'Large result',
+        from: { email: 'sender@example.com' },
+        to: [], cc: [], bcc: [],
+        receivedAt: '2026-07-22T14:00:00.000Z',
+        isRead: true,
+        hasAttachments: false,
+        body: 'x'.repeat(9 * 1024 * 1024),
+      },
+    ]);
+    const largeBodyResult = await search.run({}, {
+      query: 'Large',
+      mailbox: 'work@example.com',
+      limit: 1,
+      search_scope: 'all-visible',
+    }) as { searchSnapshot: string };
+    expect(JSON.stringify(largeBodyResult).length).toBeLessThan(10_000);
+    const realNow = Date.now;
+    vi.spyOn(Date, 'now').mockReturnValue(realNow() + 6 * 60 * 1000);
+    await expect(search.run({}, {
+      query: 'Large',
+      mailbox: 'work@example.com',
+      limit: 1,
+      offset: 1,
+      search_scope: 'all-visible',
+      search_snapshot: largeBodyResult.searchSnapshot,
+    })).rejects.toThrow(/SEARCH_SNAPSHOT_INVALID/);
+    vi.restoreAllMocks();
     await expect(search.run({}, {
       query: 'Nala',
       mailbox: 'work@example.com',

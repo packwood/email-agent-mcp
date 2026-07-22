@@ -92,6 +92,26 @@ const MAX_SEARCH_CANDIDATES = 1000;
 const MAX_SEARCH_OFFSET = 10_000;
 const SEARCH_SNAPSHOT_TTL_MS = 5 * 60 * 1000;
 const MAX_SEARCH_SNAPSHOTS = 24;
+const MAX_SEARCH_SNAPSHOT_BYTES = 8 * 1024 * 1024;
+
+interface CachedSearchRow {
+  id: string;
+  subject: string;
+  from: string;
+  to: string[];
+  cc: string[];
+  bcc: string[];
+  receivedAt: string;
+  isRead: boolean;
+  hasAttachments: boolean;
+  mailbox: string;
+  snippet?: string;
+  matchClassification: 'verified-header' | 'verified-visible-body' | 'unexplained-provider-hit';
+  matchedFields: string[];
+  threadId?: string;
+  conversationId?: string;
+  isDraft?: boolean;
+}
 
 // Re-export types for the action registry
 export interface McpTool {
@@ -764,10 +784,26 @@ export async function buildLazyActions(
   const searchSnapshots = new Map<string, {
     expiresAt: number;
     signature: string;
-    messages: Array<EmailMessage & { mailbox: string }>;
+    messages: CachedSearchRow[];
     candidateLimitReached: boolean;
     providerQueries: Array<{ mailbox: string; provider: 'microsoft' | 'gmail'; query: string }>;
+    bytes: number;
   }>();
+  let searchSnapshotBytes = 0;
+  const deleteSearchSnapshot = (id: string): void => {
+    const existing = searchSnapshots.get(id);
+    if (!existing) return;
+    searchSnapshotBytes -= existing.bytes;
+    searchSnapshots.delete(id);
+  };
+  const pruneExpiredSearchSnapshots = (): void => {
+    const now = Date.now();
+    for (const [id, snapshot] of searchSnapshots) {
+      if (snapshot.expiresAt <= now) deleteSearchSnapshot(id);
+    }
+  };
+  const snapshotCleanupTimer = setInterval(pruneExpiredSearchSnapshots, SEARCH_SNAPSHOT_TTL_MS);
+  snapshotCleanupTimer.unref();
 
   const {
     sendEmailAction,
@@ -1109,20 +1145,23 @@ export async function buildLazyActions(
         const resolved = inp.mailbox === null ? null : resolveMailboxContext(state, inp.mailbox);
         const mailboxes = resolved ? [resolved.mailbox] : getConnectedMailboxes(state);
         const signature = JSON.stringify({
-          mailboxes: mailboxes.map(mailbox => `${mailbox.providerType}:${mailbox.name}`).sort(),
+          mailboxes: mailboxes
+            .map(mailbox => `${mailbox.providerType}:${mailbox.name}:${mailbox.emailAddress}`)
+            .sort(),
           request: canonicalEffectiveQuery(searchInput),
+          verifyMatches: inp.verify_matches ?? false,
+          includeSnippet: inp.include_snippet ?? false,
         });
         const now = Date.now();
-        for (const [id, snapshot] of searchSnapshots) {
-          if (snapshot.expiresAt <= now) searchSnapshots.delete(id);
-        }
+        pruneExpiredSearchSnapshots();
 
         let searchSnapshot = inp.search_snapshot;
         let snapshot = searchSnapshot ? searchSnapshots.get(searchSnapshot) : undefined;
         if (searchSnapshot && (!snapshot || snapshot.expiresAt <= now || snapshot.signature !== signature)) {
-          searchSnapshots.delete(searchSnapshot);
+          deleteSearchSnapshot(searchSnapshot);
           throw new Error('SEARCH_SNAPSHOT_INVALID: snapshot expired or does not match this request');
         }
+        if (snapshot) snapshot.expiresAt = Date.now() + SEARCH_SNAPSHOT_TTL_MS;
         if (!snapshot) {
           const fetched = await Promise.all(mailboxes.map(async mailbox => {
             const providerQuery = buildProviderSearchQuery(mailbox.providerType, searchInput);
@@ -1139,52 +1178,77 @@ export async function buildLazyActions(
               candidateLimitReached: mailboxResults.length === MAX_SEARCH_CANDIDATES,
             };
           }));
-          searchSnapshot = randomUUID();
+          const verificationTerm = searchInput.verificationTerm ?? searchInput.query;
+          const projected = fetched
+            .flatMap(item => item.messages)
+            .filter(message => inReceivedWindow(
+              message,
+              searchInput.receivedAfter,
+              searchInput.receivedBefore,
+            ))
+            .filter(message => matchesScope(message, searchInput.searchScope, verificationTerm))
+            .sort(compareSearchMessages)
+            .map(message => {
+              const snippet = boundedSnippet(message);
+              return {
+                id: message.id,
+                subject: message.subject,
+                from: formatAddress(message.from),
+                to: message.to.map(formatAddress),
+                cc: (message.cc ?? []).map(formatAddress),
+                bcc: (message.bcc ?? []).map(formatAddress),
+                receivedAt: message.receivedAt,
+                isRead: message.isRead,
+                hasAttachments: message.hasAttachments,
+                mailbox: message.mailbox,
+                ...(snippet ? { snippet } : {}),
+                ...classifyMatch(message, verificationTerm),
+                ...getEmailThreadFields(message),
+                ...getEmailDraftStatus(message),
+              };
+            });
+          const providerQueries = fetched
+            .map(item => item.providerQuery)
+            .sort((a, b) => a.mailbox.localeCompare(b.mailbox));
+          const bytes = Buffer.byteLength(JSON.stringify({ projected, providerQueries }), 'utf8');
+          if (bytes > MAX_SEARCH_SNAPSHOT_BYTES) {
+            throw new Error('SEARCH_SNAPSHOT_TOO_LARGE: projected result exceeds the cache byte budget');
+          }
           snapshot = {
-            expiresAt: now + SEARCH_SNAPSHOT_TTL_MS,
+            expiresAt: Date.now() + SEARCH_SNAPSHOT_TTL_MS,
             signature,
-            messages: fetched.flatMap(item => item.messages),
+            messages: projected,
             candidateLimitReached: fetched.some(item => item.candidateLimitReached),
-            providerQueries: fetched.map(item => item.providerQuery).sort((a, b) => a.mailbox.localeCompare(b.mailbox)),
+            providerQueries,
+            bytes,
           };
-          while (searchSnapshots.size >= MAX_SEARCH_SNAPSHOTS) {
+          if (projected.length > limit) {
+            searchSnapshot = randomUUID();
+          }
+          while (
+            searchSnapshot &&
+            (searchSnapshots.size >= MAX_SEARCH_SNAPSHOTS || searchSnapshotBytes + bytes > MAX_SEARCH_SNAPSHOT_BYTES)
+          ) {
             const oldest = searchSnapshots.keys().next().value as string | undefined;
             if (!oldest) break;
-            searchSnapshots.delete(oldest);
+            deleteSearchSnapshot(oldest);
           }
-          searchSnapshots.set(searchSnapshot, snapshot);
+          if (searchSnapshot) {
+            searchSnapshots.set(searchSnapshot, snapshot);
+            searchSnapshotBytes += bytes;
+          }
         }
-        const { messages: results, candidateLimitReached, providerQueries } = snapshot;
-        const verificationTerm = searchInput.verificationTerm ?? searchInput.query;
-        const filtered = results
-          .filter(message => inReceivedWindow(
-            message,
-            searchInput.receivedAfter,
-            searchInput.receivedBefore,
-          ))
-          .filter(message => matchesScope(message, searchInput.searchScope, verificationTerm))
-          .sort(compareSearchMessages);
-        const page = filtered.slice(offset, offset + limit);
-        const hasKnownNextPage = filtered.length > offset + page.length;
+        const { messages, candidateLimitReached, providerQueries } = snapshot;
+        const page = messages.slice(offset, offset + limit);
+        const hasKnownNextPage = messages.length > offset + page.length;
         const isTruncated = candidateLimitReached || hasKnownNextPage;
         return {
-          emails: page.map(m => {
-            const snippet = inp.include_snippet ? boundedSnippet(m) : undefined;
+          emails: page.map(message => {
+            const { snippet, matchClassification, matchedFields, ...row } = message;
             return {
-              id: m.id,
-              subject: m.subject,
-              from: formatAddress(m.from),
-              to: m.to.map(formatAddress),
-              cc: (m.cc ?? []).map(formatAddress),
-              bcc: (m.bcc ?? []).map(formatAddress),
-              receivedAt: m.receivedAt,
-              isRead: m.isRead,
-              hasAttachments: m.hasAttachments,
-              mailbox: m.mailbox,
-              ...(snippet ? { snippet } : {}),
-              ...(inp.verify_matches ? classifyMatch(m, verificationTerm) : {}),
-              ...getEmailThreadFields(m),
-              ...getEmailDraftStatus(m),
+              ...row,
+              ...(inp.include_snippet && snippet ? { snippet } : {}),
+              ...(inp.verify_matches ? { matchClassification, matchedFields } : {}),
             };
           }),
           returnedCount: page.length,
@@ -1195,7 +1259,7 @@ export async function buildLazyActions(
           candidateLimitReached,
           canonicalQuery: canonicalEffectiveQuery(searchInput),
           providerQueries: providerQueries.sort((a, b) => a.mailbox.localeCompare(b.mailbox)),
-          searchSnapshot,
+          ...(searchSnapshot ? { searchSnapshot } : {}),
         };
       },
     },
