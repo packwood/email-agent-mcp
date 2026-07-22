@@ -478,6 +478,21 @@ describe('provider-microsoft/Attachment Download', () => {
     await expect(provider.listAttachments('msg-1')).rejects.toThrow(/pagination did not terminate/);
   });
 
+  it('fails during pagination before accumulating more than 500 attachments', async () => {
+    const attachment = (id: string) => ({ id, name: `${id}.txt`, contentType: 'text/plain', size: 1 });
+    const client = createSchemaValidatingClient([
+      {
+        value: Array.from({ length: 400 }, (_, index) => attachment(`a-${index}`)),
+        '@odata.nextLink': 'https://graph.microsoft.com/v1.0/me/messages/msg-1/attachments?page=2',
+      },
+      { value: Array.from({ length: 101 }, (_, index) => attachment(`b-${index}`)) },
+    ]);
+    const provider = new GraphEmailProvider(client);
+
+    await expect(provider.listAttachments('msg-1')).rejects.toThrow(/Attachment count exceeds 500/);
+    expect(client.get).toHaveBeenCalledTimes(2);
+  });
+
   it('Scenario: downloadAttachment decodes contentBytes and uses the fileAttachment $select cast', async () => {
     const PAYLOAD = Buffer.from('hello world from a test attachment');
     const client = createSchemaValidatingClient([

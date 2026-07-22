@@ -237,6 +237,7 @@ const MESSAGE_SELECT = [
   // default projection already carries it there.
   'isDraft',
 ].join(',');
+const MAX_ATTACHMENT_COUNT = 500;
 
 // Graph message and attachment IDs are base64url-flavored and routinely contain
 // `=`, `+`, `/`, `_`, `-`. Path segments must encode `+`, `/`, and `=` or Graph
@@ -400,6 +401,9 @@ export class GraphEmailProvider implements EmailReader, EmailSender, EmailSchedu
 
     try {
       const response = await this.client.get(expandedUrl) as unknown as GraphMessage;
+      if ((response.attachments?.length ?? 0) > MAX_ATTACHMENT_COUNT) {
+        throw new Error(`Attachment count exceeds ${MAX_ATTACHMENT_COUNT}`);
+      }
       return mapGraphMessage(response);
     } catch (err) {
       // Some mailboxes reject nested $select inside $expand; fall back to a
@@ -525,7 +529,11 @@ export class GraphEmailProvider implements EmailReader, EmailSender, EmailSchedu
       }
       visitedUrls.add(url);
       const response = await this.client.get(url) as { value?: GraphAttachment[]; '@odata.nextLink'?: string };
-      attachments.push(...(response.value ?? []));
+      const page = response.value ?? [];
+      if (attachments.length + page.length > MAX_ATTACHMENT_COUNT) {
+        throw new Error(`Attachment count exceeds ${MAX_ATTACHMENT_COUNT} for message`);
+      }
+      attachments.push(...page);
       url = response['@odata.nextLink'];
     }
     return attachments.map(a => ({
