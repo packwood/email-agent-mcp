@@ -473,7 +473,7 @@ export class GraphEmailProvider implements EmailReader, EmailSender, EmailSchedu
       while (url) {
         if (visitedUrls.size >= maxPages || visitedUrls.has(url)) {
           console.warn(
-            `[GraphEmailProvider] getThread hit pagination safety limit for conversation ${conversationId}; returning ${graphMessages.length} messages fetched so far`,
+            `[GraphEmailProvider] getThread hit pagination safety limit; returning ${graphMessages.length} messages fetched so far`,
           );
           truncated = true;
           break;
