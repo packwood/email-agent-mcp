@@ -384,6 +384,19 @@ describe('provider-gmail/Pagination', () => {
       pageToken: 'page-2',
     });
   });
+
+  it('fails instead of returning partial results when a page token loops', async () => {
+    const client = createMockGmailClient({
+      listMessages: vi.fn().mockResolvedValue({
+        messages: [{ id: 'm-1', threadId: 't-1' }],
+        nextPageToken: 'loop',
+      }),
+    });
+    const provider = new GmailEmailProvider(client);
+
+    await expect(provider.searchMessages('participant@example.com', undefined, 2, 2))
+      .rejects.toThrow(/pagination did not terminate/);
+  });
 });
 
 describe('provider-gmail/Draft Operations', () => {

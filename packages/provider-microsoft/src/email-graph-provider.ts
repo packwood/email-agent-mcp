@@ -251,6 +251,26 @@ export interface DeltaResult {
   nextDeltaLink: string;
 }
 
+function trustedGraphUrl(url: string): string {
+  const fullUrl = url.startsWith('/') ? `https://graph.microsoft.com/v1.0${url}` : url;
+  let parsed: URL;
+  try {
+    parsed = new URL(fullUrl);
+  } catch {
+    throw new Error('Untrusted Microsoft Graph URL');
+  }
+  if (
+    parsed.protocol !== 'https:' ||
+    parsed.hostname !== 'graph.microsoft.com' ||
+    parsed.port !== '' ||
+    parsed.username !== '' ||
+    parsed.password !== ''
+  ) {
+    throw new Error('Untrusted Microsoft Graph URL');
+  }
+  return parsed.toString();
+}
+
 /**
  * Real Graph API client using fetch + Bearer token.
  * Used when connected to a real mailbox via DelegatedAuthManager.
@@ -279,8 +299,8 @@ export class RealGraphApiClient implements GraphApiClient {
   }
 
   async get(url: string): Promise<{ value?: unknown[]; [key: string]: unknown }> {
+    const fullUrl = trustedGraphUrl(url);
     const token = await this.getToken();
-    const fullUrl = url.startsWith('http') ? url : `https://graph.microsoft.com/v1.0${url}`;
     const resp = await this.fetchWithAuthRetry(fullUrl, {
       headers: { Authorization: `Bearer ${token}` },
     });
@@ -291,8 +311,8 @@ export class RealGraphApiClient implements GraphApiClient {
   }
 
   async post(url: string, body?: unknown): Promise<{ id?: string; [key: string]: unknown }> {
+    const fullUrl = trustedGraphUrl(url);
     const token = await this.getToken();
-    const fullUrl = url.startsWith('http') ? url : `https://graph.microsoft.com/v1.0${url}`;
     const headers: Record<string, string> = { Authorization: `Bearer ${token}` };
     const init: RequestInit = { method: 'POST', headers };
     if (body !== undefined) {
@@ -310,8 +330,8 @@ export class RealGraphApiClient implements GraphApiClient {
   }
 
   async patch(url: string, body: unknown): Promise<void> {
+    const fullUrl = trustedGraphUrl(url);
     const token = await this.getToken();
-    const fullUrl = url.startsWith('http') ? url : `https://graph.microsoft.com/v1.0${url}`;
     const resp = await this.fetchWithAuthRetry(fullUrl, {
       method: 'PATCH',
       headers: {
@@ -326,8 +346,8 @@ export class RealGraphApiClient implements GraphApiClient {
   }
 
   async delete(url: string): Promise<void> {
+    const fullUrl = trustedGraphUrl(url);
     const token = await this.getToken();
-    const fullUrl = url.startsWith('http') ? url : `https://graph.microsoft.com/v1.0${url}`;
     const resp = await this.fetchWithAuthRetry(fullUrl, {
       method: 'DELETE',
       headers: { Authorization: `Bearer ${token}` },
@@ -390,14 +410,10 @@ export class GraphEmailProvider implements EmailReader, EmailSender, EmailSchedu
     const message = await this.client.get(
       `${this.basePath}/messages/${encodedId}?$select=${MESSAGE_SELECT}`,
     ) as unknown as GraphMessage;
-    const attachments = await this.client.get(
-      `${this.basePath}/messages/${encodedId}/attachments?$select=${ATTACHMENT_SELECT}`,
-    );
-
-    return mapGraphMessage({
-      ...message,
-      attachments: ((attachments.value ?? []) as GraphAttachment[]),
-    });
+    return {
+      ...mapGraphMessage(message),
+      attachments: await this.listAttachments(id),
+    };
   }
 
   async searchMessages(query: string, folder?: string, limit?: number, offset?: number): Promise<EmailMessage[]> {

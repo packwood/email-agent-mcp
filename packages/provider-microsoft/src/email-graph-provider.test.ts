@@ -250,6 +250,11 @@ describe('provider-microsoft/Message Mapping', () => {
             size: 245000,
             isInline: false,
           },
+        ],
+        '@odata.nextLink': 'https://graph.microsoft.com/v1.0/me/messages/msg-attachments/attachments?page=2',
+      },
+      {
+        value: [
           {
             id: 'att-inline',
             name: 'inline.png',
@@ -294,6 +299,10 @@ describe('provider-microsoft/Message Mapping', () => {
     expect(client.get).toHaveBeenNthCalledWith(
       3,
       '/me/messages/msg-attachments/attachments?$select=id,name,contentType,size,isInline,microsoft.graph.fileAttachment/contentId',
+    );
+    expect(client.get).toHaveBeenNthCalledWith(
+      4,
+      'https://graph.microsoft.com/v1.0/me/messages/msg-attachments/attachments?page=2',
     );
   });
 
@@ -1932,6 +1941,21 @@ describe('provider-microsoft/Graph API Client', () => {
         headers: { Authorization: 'Bearer token-123' },
       },
     );
+
+    vi.unstubAllGlobals();
+  });
+
+  it('rejects untrusted absolute URLs before retrieving or sending a bearer token', async () => {
+    const getToken = vi.fn().mockResolvedValue('token-123');
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+    const client = new RealGraphApiClient(getToken);
+
+    await expect(client.get('https://attacker.example/steal')).rejects.toThrow(/Untrusted Microsoft Graph URL/);
+    await expect(client.get('http://graph.microsoft.com/v1.0/me')).rejects.toThrow(/Untrusted Microsoft Graph URL/);
+    await expect(client.get('https://graph.microsoft.com.evil.example/v1.0/me')).rejects.toThrow(/Untrusted Microsoft Graph URL/);
+    expect(getToken).not.toHaveBeenCalled();
+    expect(fetchMock).not.toHaveBeenCalled();
 
     vi.unstubAllGlobals();
   });

@@ -142,7 +142,8 @@ export class GmailEmailProvider {
       });
       collected.push(...(response.messages ?? []));
       const next = response.nextPageToken;
-      if (!next || visitedTokens.has(next)) break;
+      if (!next) break;
+      if (visitedTokens.has(next)) throw new Error('Gmail message pagination did not terminate');
       visitedTokens.add(next);
       pageToken = next;
     }
