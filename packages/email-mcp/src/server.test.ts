@@ -1033,17 +1033,27 @@ describe('mcp-transport/Lazy Provider State', () => {
       search_scope: 'all-visible',
     }) as { searchSnapshot: string };
     expect(JSON.stringify(largeBodyResult).length).toBeLessThan(10_000);
-    const realNow = Date.now;
-    vi.spyOn(Date, 'now').mockReturnValue(realNow() + 6 * 60 * 1000);
-    await expect(search.run({}, {
-      query: 'Large',
+
+    let bodyReads = 0;
+    searchMessages.mockResolvedValueOnce([{
+      id: 'metadata-only',
+      subject: 'Metadata only',
+      from: { email: 'sender@example.com' },
+      to: [], cc: [], bcc: [],
+      receivedAt: '2026-07-22T15:00:00.000Z',
+      isRead: true,
+      hasAttachments: false,
+      get body() {
+        bodyReads += 1;
+        return 'Body must remain untouched';
+      },
+    }]);
+    await search.run({}, {
+      query: 'native-query',
       mailbox: 'work@example.com',
-      limit: 1,
-      offset: 1,
-      search_scope: 'all-visible',
-      search_snapshot: largeBodyResult.searchSnapshot,
-    })).rejects.toThrow(/SEARCH_SNAPSHOT_INVALID/);
-    vi.restoreAllMocks();
+      search_scope: 'any',
+    });
+    expect(bodyReads).toBe(0);
     await expect(search.run({}, {
       query: 'Nala',
       mailbox: 'work@example.com',

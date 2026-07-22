@@ -142,7 +142,11 @@ export function boundedSnippet(message: EmailMessage): string | undefined {
   return text.length <= SNIPPET_LIMIT ? text : `${text.slice(0, SNIPPET_LIMIT - 1)}…`;
 }
 
-export function classifyMatch(message: EmailMessage, query: string): MatchEvidence {
+export function classifyMatch(
+  message: EmailMessage,
+  query: string,
+  options: { includeBody?: boolean } = {},
+): MatchEvidence {
   const needle = normalize(query.trim().replace(/^"|"$/g, ''));
   if (!needle) return { matchClassification: 'unexplained-provider-hit', matchedFields: [] };
 
@@ -156,7 +160,9 @@ export function classifyMatch(message: EmailMessage, query: string): MatchEviden
   const matchedFields = [...new Set(fields
     .filter(([, value]) => normalize(value).includes(needle))
     .map(([field]) => field))];
-  if (normalize(visibleBody(message)).includes(needle)) matchedFields.push('body');
+  if (options.includeBody !== false && normalize(visibleBody(message)).includes(needle)) {
+    matchedFields.push('body');
+  }
   if (matchedFields.length > 0) {
     return {
       matchClassification: matchedFields.some(field => field !== 'body')
@@ -170,7 +176,14 @@ export function classifyMatch(message: EmailMessage, query: string): MatchEviden
 
 export function matchesScope(message: EmailMessage, scope: SearchScope, query: string): boolean {
   if (scope === 'any') return true;
-  const evidence = classifyMatch(message, query);
+  const evidence = classifyMatch(message, query, {
+    includeBody: scope === 'all-visible' || scope === 'body',
+  });
+  return matchEvidenceSupportsScope(evidence, scope);
+}
+
+export function matchEvidenceSupportsScope(evidence: MatchEvidence, scope: SearchScope): boolean {
+  if (scope === 'any') return true;
   if (scope === 'all-visible') return evidence.matchedFields.length > 0;
   if (scope === 'participants') {
     return evidence.matchedFields.some(field => ['from', 'to', 'cc', 'bcc'].includes(field));

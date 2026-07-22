@@ -14,12 +14,12 @@ import {
   buildProviderSearchQuery,
   canonicalEffectiveQuery,
   classifyMatch,
-  compareSearchMessages,
   formatAddress,
   inReceivedWindow,
-  matchesScope,
+  matchEvidenceSupportsScope,
   type DeterministicSearchInput,
 } from './search-contract.js';
+import { SearchSnapshotStore } from './search-snapshot-store.js';
 import { z } from 'zod';
 
 /**
@@ -106,11 +106,17 @@ interface CachedSearchRow {
   hasAttachments: boolean;
   mailbox: string;
   snippet?: string;
-  matchClassification: 'verified-header' | 'verified-visible-body' | 'unexplained-provider-hit';
-  matchedFields: string[];
+  matchClassification?: 'verified-header' | 'verified-visible-body' | 'unexplained-provider-hit';
+  matchedFields?: string[];
   threadId?: string;
   conversationId?: string;
   isDraft?: boolean;
+}
+
+interface CachedSearchSnapshot {
+  messages: CachedSearchRow[];
+  candidateLimitReached: boolean;
+  providerQueries: Array<{ mailbox: string; provider: 'microsoft' | 'gmail'; query: string }>;
 }
 
 // Re-export types for the action registry
@@ -781,29 +787,11 @@ export async function buildLazyActions(
   // the boundary is intentional and operator-overridable rather than an
   // implicit process.cwd() fallback inside the file loaders.
   const safeDir = process.env.EMAIL_MCP_SAFE_DIR || process.cwd();
-  const searchSnapshots = new Map<string, {
-    expiresAt: number;
-    signature: string;
-    messages: CachedSearchRow[];
-    candidateLimitReached: boolean;
-    providerQueries: Array<{ mailbox: string; provider: 'microsoft' | 'gmail'; query: string }>;
-    bytes: number;
-  }>();
-  let searchSnapshotBytes = 0;
-  const deleteSearchSnapshot = (id: string): void => {
-    const existing = searchSnapshots.get(id);
-    if (!existing) return;
-    searchSnapshotBytes -= existing.bytes;
-    searchSnapshots.delete(id);
-  };
-  const pruneExpiredSearchSnapshots = (): void => {
-    const now = Date.now();
-    for (const [id, snapshot] of searchSnapshots) {
-      if (snapshot.expiresAt <= now) deleteSearchSnapshot(id);
-    }
-  };
-  const snapshotCleanupTimer = setInterval(pruneExpiredSearchSnapshots, SEARCH_SNAPSHOT_TTL_MS);
-  snapshotCleanupTimer.unref();
+  const searchSnapshots = new SearchSnapshotStore<CachedSearchSnapshot>({
+    ttlMs: SEARCH_SNAPSHOT_TTL_MS,
+    maxEntries: MAX_SEARCH_SNAPSHOTS,
+    maxBytes: MAX_SEARCH_SNAPSHOT_BYTES,
+  });
 
   const {
     sendEmailAction,
@@ -1152,16 +1140,11 @@ export async function buildLazyActions(
           verifyMatches: inp.verify_matches ?? false,
           includeSnippet: inp.include_snippet ?? false,
         });
-        const now = Date.now();
-        pruneExpiredSearchSnapshots();
-
         let searchSnapshot = inp.search_snapshot;
-        let snapshot = searchSnapshot ? searchSnapshots.get(searchSnapshot) : undefined;
-        if (searchSnapshot && (!snapshot || snapshot.expiresAt <= now || snapshot.signature !== signature)) {
-          deleteSearchSnapshot(searchSnapshot);
+        let snapshot = searchSnapshot ? searchSnapshots.get(searchSnapshot, signature) : undefined;
+        if (searchSnapshot && !snapshot) {
           throw new Error('SEARCH_SNAPSHOT_INVALID: snapshot expired or does not match this request');
         }
-        if (snapshot) snapshot.expiresAt = Date.now() + SEARCH_SNAPSHOT_TTL_MS;
         if (!snapshot) {
           const fetched = await Promise.all(mailboxes.map(async mailbox => {
             const providerQuery = buildProviderSearchQuery(mailbox.providerType, searchInput);
@@ -1173,24 +1156,44 @@ export async function buildLazyActions(
               { strict: true },
             );
             return {
+              mailbox: mailbox.name,
               providerQuery: { mailbox: mailbox.name, provider: mailbox.providerType, query: providerQuery },
-              messages: mailboxResults.map(result => ({ ...result, mailbox: mailbox.name })),
+              messages: mailboxResults,
               candidateLimitReached: mailboxResults.length === MAX_SEARCH_CANDIDATES,
             };
           }));
           const verificationTerm = searchInput.verificationTerm ?? searchInput.query;
+          const includeEvidence = inp.verify_matches === true;
+          const scopeNeedsBody = searchInput.searchScope === 'all-visible' || searchInput.searchScope === 'body';
           const projected = fetched
-            .flatMap(item => item.messages)
-            .filter(message => inReceivedWindow(
+            .flatMap(item => item.messages.map(message => ({ message, mailbox: item.mailbox })))
+            .filter(({ message }) => inReceivedWindow(
               message,
               searchInput.receivedAfter,
               searchInput.receivedBefore,
             ))
-            .filter(message => matchesScope(message, searchInput.searchScope, verificationTerm))
-            .sort(compareSearchMessages)
-            .map(message => {
-              const snippet = boundedSnippet(message);
-              return {
+            .sort((a, b) => {
+              const timeDifference = Date.parse(b.message.receivedAt) - Date.parse(a.message.receivedAt);
+              if (timeDifference !== 0) return timeDifference;
+              const mailboxDifference = a.mailbox.localeCompare(b.mailbox);
+              return mailboxDifference !== 0
+                ? mailboxDifference
+                : a.message.id.localeCompare(b.message.id);
+            })
+            .flatMap(({ message, mailbox }) => {
+              const evidence = searchInput.searchScope !== 'any' || includeEvidence
+                ? classifyMatch(message, verificationTerm, {
+                  includeBody: includeEvidence || scopeNeedsBody,
+                })
+                : undefined;
+              if (
+                searchInput.searchScope !== 'any' &&
+                (!evidence || !matchEvidenceSupportsScope(evidence, searchInput.searchScope))
+              ) {
+                return [];
+              }
+              const snippet = inp.include_snippet ? boundedSnippet(message) : undefined;
+              return [{
                 id: message.id,
                 subject: message.subject,
                 from: formatAddress(message.from),
@@ -1200,42 +1203,27 @@ export async function buildLazyActions(
                 receivedAt: message.receivedAt,
                 isRead: message.isRead,
                 hasAttachments: message.hasAttachments,
-                mailbox: message.mailbox,
+                mailbox,
                 ...(snippet ? { snippet } : {}),
-                ...classifyMatch(message, verificationTerm),
+                ...(includeEvidence && evidence ? evidence : {}),
                 ...getEmailThreadFields(message),
                 ...getEmailDraftStatus(message),
-              };
+              }];
             });
           const providerQueries = fetched
             .map(item => item.providerQuery)
             .sort((a, b) => a.mailbox.localeCompare(b.mailbox));
           const bytes = Buffer.byteLength(JSON.stringify({ projected, providerQueries }), 'utf8');
-          if (bytes > MAX_SEARCH_SNAPSHOT_BYTES) {
-            throw new Error('SEARCH_SNAPSHOT_TOO_LARGE: projected result exceeds the cache byte budget');
-          }
           snapshot = {
-            expiresAt: Date.now() + SEARCH_SNAPSHOT_TTL_MS,
-            signature,
             messages: projected,
             candidateLimitReached: fetched.some(item => item.candidateLimitReached),
             providerQueries,
-            bytes,
           };
           if (projected.length > limit) {
             searchSnapshot = randomUUID();
           }
-          while (
-            searchSnapshot &&
-            (searchSnapshots.size >= MAX_SEARCH_SNAPSHOTS || searchSnapshotBytes + bytes > MAX_SEARCH_SNAPSHOT_BYTES)
-          ) {
-            const oldest = searchSnapshots.keys().next().value as string | undefined;
-            if (!oldest) break;
-            deleteSearchSnapshot(oldest);
-          }
           if (searchSnapshot) {
-            searchSnapshots.set(searchSnapshot, snapshot);
-            searchSnapshotBytes += bytes;
+            searchSnapshots.set(searchSnapshot, signature, snapshot, bytes);
           }
         }
         const { messages, candidateLimitReached, providerQueries } = snapshot;
