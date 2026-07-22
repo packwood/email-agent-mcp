@@ -29,10 +29,8 @@ function quoteGmailLiteral(query: string): string {
 }
 
 function kqlLiteral(query: string): string {
-  return query
-    .replace(/[()"']/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
+  const escaped = query.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+  return `\\"${escaped}\\"`;
 }
 
 function utcDate(value: number): string {

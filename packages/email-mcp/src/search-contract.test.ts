@@ -35,7 +35,7 @@ describe('deterministic search contract', () => {
       receivedBefore: '2026-07-22T17:37:00.000Z',
     };
     expect(buildProviderSearchQuery('microsoft', input)).toBe(
-      '(participants:(Nala Equities)) AND received>=2026-07-14 AND received<=2026-07-23',
+      '(participants:(\\"Nala Equities\\")) AND received>=2026-07-14 AND received<=2026-07-23',
     );
     expect(buildProviderSearchQuery('gmail', input)).toContain(
       '{from:"Nala Equities" to:"Nala Equities" cc:"Nala Equities" bcc:"Nala Equities"}',
@@ -43,7 +43,11 @@ describe('deterministic search contract', () => {
     expect(buildProviderSearchQuery('microsoft', {
       query: 'Nala',
       searchScope: 'all-visible',
-    })).toBe('(participants:(Nala) OR subject:(Nala) OR body:(Nala))');
+    })).toBe('(participants:(\\"Nala\\") OR subject:(\\"Nala\\") OR body:(\\"Nala\\"))');
+    expect(buildProviderSearchQuery('microsoft', {
+      query: 'AND ("quoted")',
+      searchScope: 'subject',
+    })).toBe('subject:(\\"AND (\\"quoted\\")\\")');
     expect(canonicalEffectiveQuery(input)).toBe(
       'scope=participants; query="Nala Equities"; received_after=2026-07-15T17:37:00.000Z; received_before=2026-07-22T17:37:00.000Z',
     );
@@ -98,6 +102,11 @@ describe('deterministic search contract', () => {
       'a@example.com',
       'z@example.com',
     ]);
+  });
+
+  it('preserves duplicate provider rows during deterministic ordering', () => {
+    const messages = [message({ id: 'duplicate' }), message({ id: 'duplicate' })];
+    expect(messages.sort(compareSearchMessages)).toHaveLength(2);
   });
 
   it('bounds visible snippets and strips HTML-only markup', () => {

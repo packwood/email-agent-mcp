@@ -1,6 +1,7 @@
 // MCP server — thin transport adapter mapping action registry to MCP tools
 import { createRequire } from 'node:module';
-import type { DeletePolicy, EmailAction, EmailProvider } from '@usejunior/email-core';
+import { randomUUID } from 'node:crypto';
+import type { DeletePolicy, EmailAction, EmailMessage, EmailProvider } from '@usejunior/email-core';
 import {
   EmailDraftStatusSchema,
   EmailThreadFieldsSchema,
@@ -88,6 +89,9 @@ const ISO_TIMESTAMP = z.string().refine(
   'must be an ISO-8601 timestamp with an explicit UTC offset',
 );
 const MAX_SEARCH_CANDIDATES = 1000;
+const MAX_SEARCH_OFFSET = 10_000;
+const SEARCH_SNAPSHOT_TTL_MS = 5 * 60 * 1000;
+const MAX_SEARCH_SNAPSHOTS = 24;
 
 // Re-export types for the action registry
 export interface McpTool {
@@ -757,6 +761,13 @@ export async function buildLazyActions(
   // the boundary is intentional and operator-overridable rather than an
   // implicit process.cwd() fallback inside the file loaders.
   const safeDir = process.env.EMAIL_MCP_SAFE_DIR || process.cwd();
+  const searchSnapshots = new Map<string, {
+    expiresAt: number;
+    signature: string;
+    messages: Array<EmailMessage & { mailbox: string }>;
+    candidateLimitReached: boolean;
+    providerQueries: Array<{ mailbox: string; provider: 'microsoft' | 'gmail'; query: string }>;
+  }>();
 
   const {
     sendEmailAction,
@@ -970,16 +981,26 @@ export async function buildLazyActions(
         query: z.string().trim().min(1).max(512),
         mailbox: z.string().nullable().optional(),
         limit: z.number().int().min(1).max(100).optional(),
-        offset: z.number().int().min(0).max(999).optional(),
+        offset: z.number().int().min(0).max(MAX_SEARCH_OFFSET).optional(),
         received_after: ISO_TIMESTAMP.optional(),
         received_before: ISO_TIMESTAMP.optional(),
         search_scope: z.enum(SEARCH_SCOPES).optional(),
         verify_matches: z.boolean().optional(),
         verification_term: z.string().trim().min(1).max(512).optional(),
         include_snippet: z.boolean().optional(),
+        search_snapshot: z.string().uuid().optional(),
       }).superRefine((value, ctx) => {
-        if ((value.offset ?? 0) + (value.limit ?? 25) > MAX_SEARCH_CANDIDATES) {
-          ctx.addIssue({ code: 'custom', message: 'offset + limit must not exceed 1000' });
+        if ((value.offset ?? 0) + (value.limit ?? 25) > MAX_SEARCH_OFFSET + 100) {
+          ctx.addIssue({ code: 'custom', message: 'offset + limit exceeds the search pagination bound' });
+        }
+        if ((value.offset ?? 0) > 0 && !value.search_snapshot) {
+          ctx.addIssue({ code: 'custom', message: 'search_snapshot is required when offset is positive' });
+        }
+        if ((value.search_scope ?? 'any') !== 'any' && value.verification_term !== undefined) {
+          ctx.addIssue({ code: 'custom', message: 'verification_term is only valid with search_scope any' });
+        }
+        if ((value.search_scope ?? 'any') === 'any' && value.verify_matches && !value.verification_term) {
+          ctx.addIssue({ code: 'custom', message: 'verification_term is required to verify a provider-native query' });
         }
       }),
       output: z.object({
@@ -1012,6 +1033,7 @@ export async function buildLazyActions(
           provider: z.enum(['microsoft', 'gmail']),
           query: z.string(),
         })),
+        searchSnapshot: z.string().uuid().optional(),
       }),
       annotations: { readOnlyHint: true, destructiveHint: false },
       run: async (_ctx, input) => {
@@ -1027,14 +1049,18 @@ export async function buildLazyActions(
           verify_matches?: boolean;
           verification_term?: string;
           include_snippet?: boolean;
+          search_snapshot?: string;
         };
         const limit = inp.limit ?? 25;
         const offset = inp.offset ?? 0;
         if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
           throw new Error('SEARCH_LIMIT_INVALID: limit must be an integer from 1 through 100');
         }
-        if (!Number.isInteger(offset) || offset < 0 || offset + limit > MAX_SEARCH_CANDIDATES) {
-          throw new Error('SEARCH_OFFSET_INVALID: offset + limit must not exceed 1000');
+        if (!Number.isInteger(offset) || offset < 0 || offset > MAX_SEARCH_OFFSET || offset + limit > MAX_SEARCH_OFFSET + 100) {
+          throw new Error('SEARCH_OFFSET_INVALID: offset exceeds the search pagination bound');
+        }
+        if (offset > 0 && !inp.search_snapshot) {
+          throw new Error('SEARCH_SNAPSHOT_REQUIRED: pass the prior page searchSnapshot');
         }
         const searchInput: DeterministicSearchInput = {
           query: inp.query,
@@ -1050,6 +1076,12 @@ export async function buildLazyActions(
           !searchInput.verificationTerm.trim() || searchInput.verificationTerm.length > 512
         )) {
           throw new Error('SEARCH_VERIFICATION_TERM_INVALID: verification_term must contain 1 through 512 characters');
+        }
+        if (searchInput.searchScope !== 'any' && searchInput.verificationTerm !== undefined) {
+          throw new Error('SEARCH_VERIFICATION_TERM_INVALID: verification_term is only valid with search_scope any');
+        }
+        if (searchInput.searchScope === 'any' && inp.verify_matches && !searchInput.verificationTerm) {
+          throw new Error('SEARCH_VERIFICATION_TERM_REQUIRED: provider-native verification requires verification_term');
         }
         for (const [name, value] of [
           ['received_after', searchInput.receivedAfter],
@@ -1076,21 +1108,53 @@ export async function buildLazyActions(
         if (!getDefaultMailbox(state)) return emptyResult;
         const resolved = inp.mailbox === null ? null : resolveMailboxContext(state, inp.mailbox);
         const mailboxes = resolved ? [resolved.mailbox] : getConnectedMailboxes(state);
-        let candidateLimitReached = false;
-        const providerQueries: Array<{ mailbox: string; provider: 'microsoft' | 'gmail'; query: string }> = [];
-        const results = (await Promise.all(mailboxes.map(async mailbox => {
-          const providerQuery = buildProviderSearchQuery(mailbox.providerType, searchInput);
-          providerQueries.push({ mailbox: mailbox.name, provider: mailbox.providerType, query: providerQuery });
-          const mailboxResults = await mailbox.provider.searchMessages(
-            providerQuery,
-            undefined,
-            MAX_SEARCH_CANDIDATES,
-            0,
-            { strict: true },
-          );
-          candidateLimitReached ||= mailboxResults.length === MAX_SEARCH_CANDIDATES;
-          return mailboxResults.map(result => ({ ...result, mailbox: mailbox.name }));
-        }))).flat();
+        const signature = JSON.stringify({
+          mailboxes: mailboxes.map(mailbox => `${mailbox.providerType}:${mailbox.name}`).sort(),
+          request: canonicalEffectiveQuery(searchInput),
+        });
+        const now = Date.now();
+        for (const [id, snapshot] of searchSnapshots) {
+          if (snapshot.expiresAt <= now) searchSnapshots.delete(id);
+        }
+
+        let searchSnapshot = inp.search_snapshot;
+        let snapshot = searchSnapshot ? searchSnapshots.get(searchSnapshot) : undefined;
+        if (searchSnapshot && (!snapshot || snapshot.expiresAt <= now || snapshot.signature !== signature)) {
+          searchSnapshots.delete(searchSnapshot);
+          throw new Error('SEARCH_SNAPSHOT_INVALID: snapshot expired or does not match this request');
+        }
+        if (!snapshot) {
+          const fetched = await Promise.all(mailboxes.map(async mailbox => {
+            const providerQuery = buildProviderSearchQuery(mailbox.providerType, searchInput);
+            const mailboxResults = await mailbox.provider.searchMessages(
+              providerQuery,
+              undefined,
+              MAX_SEARCH_CANDIDATES,
+              0,
+              { strict: true },
+            );
+            return {
+              providerQuery: { mailbox: mailbox.name, provider: mailbox.providerType, query: providerQuery },
+              messages: mailboxResults.map(result => ({ ...result, mailbox: mailbox.name })),
+              candidateLimitReached: mailboxResults.length === MAX_SEARCH_CANDIDATES,
+            };
+          }));
+          searchSnapshot = randomUUID();
+          snapshot = {
+            expiresAt: now + SEARCH_SNAPSHOT_TTL_MS,
+            signature,
+            messages: fetched.flatMap(item => item.messages),
+            candidateLimitReached: fetched.some(item => item.candidateLimitReached),
+            providerQueries: fetched.map(item => item.providerQuery).sort((a, b) => a.mailbox.localeCompare(b.mailbox)),
+          };
+          while (searchSnapshots.size >= MAX_SEARCH_SNAPSHOTS) {
+            const oldest = searchSnapshots.keys().next().value as string | undefined;
+            if (!oldest) break;
+            searchSnapshots.delete(oldest);
+          }
+          searchSnapshots.set(searchSnapshot, snapshot);
+        }
+        const { messages: results, candidateLimitReached, providerQueries } = snapshot;
         const verificationTerm = searchInput.verificationTerm ?? searchInput.query;
         const filtered = results
           .filter(message => inReceivedWindow(
@@ -1125,12 +1189,13 @@ export async function buildLazyActions(
           }),
           returnedCount: page.length,
           isTruncated,
-          ...((hasKnownNextPage || candidateLimitReached) && page.length > 0
+          ...(hasKnownNextPage && page.length > 0
             ? { nextOffset: offset + page.length }
             : {}),
           candidateLimitReached,
           canonicalQuery: canonicalEffectiveQuery(searchInput),
           providerQueries: providerQueries.sort((a, b) => a.mailbox.localeCompare(b.mailbox)),
+          searchSnapshot,
         };
       },
     },

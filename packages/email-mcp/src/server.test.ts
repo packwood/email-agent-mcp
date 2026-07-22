@@ -717,6 +717,7 @@ describe('mcp-transport/Lazy Provider State', () => {
       candidateLimitReached: false,
       canonicalQuery: 'scope=any; query="license"',
       providerQueries: [{ mailbox: 'personal', provider: 'gmail', query: 'license' }],
+      searchSnapshot: expect.any(String),
     });
   });
 
@@ -826,6 +827,7 @@ describe('mcp-transport/Lazy Provider State', () => {
         { mailbox: 'personal', provider: 'gmail', query: 'license' },
         { mailbox: 'work', provider: 'microsoft', query: 'license' },
       ],
+      searchSnapshot: expect.any(String),
     });
   });
 
@@ -907,12 +909,14 @@ describe('mcp-transport/Lazy Provider State', () => {
       received_before: '2026-07-23T00:00:00.000Z',
       search_scope: 'any',
       verify_matches: true,
+      verification_term: 'Nala',
     }) as {
       emails: Array<{ id: string; matchClassification: string; matchedFields: string[] }>;
       returnedCount: number;
       isTruncated: boolean;
       nextOffset?: number;
       canonicalQuery: string;
+      searchSnapshot: string;
     };
 
     expect(searchMessages).toHaveBeenCalledWith(
@@ -937,7 +941,7 @@ describe('mcp-transport/Lazy Provider State', () => {
       isTruncated: true,
       nextOffset: 2,
       candidateLimitReached: false,
-      canonicalQuery: 'scope=any; query="Nala"; received_after=2026-07-15T00:00:00.000Z; received_before=2026-07-23T00:00:00.000Z',
+      canonicalQuery: 'scope=any; query="Nala"; verification_term="Nala"; received_after=2026-07-15T00:00:00.000Z; received_before=2026-07-23T00:00:00.000Z',
     });
 
     const secondPage = await search.run({}, {
@@ -945,12 +949,15 @@ describe('mcp-transport/Lazy Provider State', () => {
       mailbox: 'work@example.com',
       limit: 2,
       offset: 2,
+      search_snapshot: result.searchSnapshot,
       received_after: '2026-07-15T00:00:00.000Z',
       received_before: '2026-07-23T00:00:00.000Z',
       search_scope: 'any',
       verify_matches: true,
+      verification_term: 'Nala',
     }) as { emails: Array<{ id: string }> };
     expect([...result.emails, ...secondPage.emails].map(message => message.id)).toEqual(['a', 'b', 'c']);
+    expect(searchMessages).toHaveBeenCalledTimes(1);
 
     searchMessages.mockResolvedValueOnce(Array.from({ length: 1000 }, (_, index) => ({
       id: `cap-${String(index).padStart(4, '0')}`,
@@ -969,8 +976,30 @@ describe('mcp-transport/Lazy Provider State', () => {
       limit: 1,
       offset: 0,
       search_scope: 'all-visible',
-    }) as { candidateLimitReached: boolean; isTruncated: boolean; nextOffset?: number };
+    }) as { candidateLimitReached: boolean; isTruncated: boolean; nextOffset?: number; searchSnapshot: string };
     expect(capped).toMatchObject({ candidateLimitReached: true, isTruncated: true, nextOffset: 1 });
+    const terminalCappedPage = await search.run({}, {
+      query: 'Nala',
+      mailbox: 'work@example.com',
+      limit: 1,
+      offset: 999,
+      search_scope: 'all-visible',
+      search_snapshot: capped.searchSnapshot,
+    }) as { candidateLimitReached: boolean; isTruncated: boolean; nextOffset?: number };
+    expect(terminalCappedPage).toMatchObject({ candidateLimitReached: true, isTruncated: true });
+    expect(terminalCappedPage).not.toHaveProperty('nextOffset');
+    expect(searchMessages).toHaveBeenCalledTimes(2);
+    await expect(search.run({}, {
+      query: 'Nala',
+      mailbox: 'work@example.com',
+      offset: 1,
+    })).rejects.toThrow(/SEARCH_SNAPSHOT_REQUIRED/);
+    await expect(search.run({}, {
+      query: 'Nala',
+      mailbox: 'work@example.com',
+      search_scope: 'all-visible',
+      verification_term: 'the',
+    })).rejects.toThrow(/verification_term is only valid/);
   });
 
   it('Scenario: custom read_email surfaces attachment metadata from the provider', async () => {

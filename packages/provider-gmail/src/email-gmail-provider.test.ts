@@ -361,6 +361,34 @@ describe('provider-gmail/Label Mapping', () => {
 });
 
 describe('provider-gmail/Pagination', () => {
+  it('bounds concurrent Gmail detail reads at ten', async () => {
+    let active = 0;
+    let peak = 0;
+    const client = createMockGmailClient({
+      listMessages: vi.fn().mockResolvedValue({
+        messages: Array.from({ length: 25 }, (_, index) => ({ id: `m-${index}`, threadId: `t-${index}` })),
+      }),
+      getMessage: vi.fn().mockImplementation(async (id: string) => {
+        active += 1;
+        peak = Math.max(peak, active);
+        await new Promise(resolve => setTimeout(resolve, 2));
+        active -= 1;
+        return {
+          id,
+          threadId: id.replace('m-', 't-'),
+          labelIds: ['INBOX'],
+          internalDate: String(new Date('2026-07-21T12:00:00Z').getTime()),
+          payload: { headers: [{ name: 'Subject', value: id }] },
+        };
+      }),
+    });
+
+    const messages = await new GmailEmailProvider(client).searchMessages('bounded', undefined, 25, 0);
+
+    expect(messages).toHaveLength(25);
+    expect(peak).toBe(10);
+  });
+
   it('follows page tokens until an offset window is complete', async () => {
     const listMessages = vi.fn()
       .mockResolvedValueOnce({
