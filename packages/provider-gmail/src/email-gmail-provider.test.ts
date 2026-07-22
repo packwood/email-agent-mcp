@@ -110,6 +110,29 @@ describe('provider-gmail/Message Mapping', () => {
     expect(msg.folder).toBe('inbox');
   });
 
+  it('uses Gmail internalDate as receipt time instead of the sender-controlled Date header', async () => {
+    const client = createMockGmailClient({
+      getMessage: vi.fn().mockResolvedValue({
+        id: 'msg-delayed',
+        threadId: 'thread-delayed',
+        labelIds: ['INBOX'],
+        internalDate: String(new Date('2026-07-22T15:00:00Z').getTime()),
+        payload: {
+          headers: [
+            { name: 'From', value: 'sender@example.com' },
+            { name: 'To', value: 'recipient@example.com' },
+            { name: 'Subject', value: 'Delayed delivery' },
+            { name: 'Date', value: '1999-01-01T00:00:00Z' },
+          ],
+        },
+      }),
+    });
+
+    const msg = await new GmailEmailProvider(client).getMessage('msg-delayed');
+
+    expect(msg.receivedAt).toBe('2026-07-22T15:00:00.000Z');
+  });
+
   it('Scenario: Cc and Bcc headers map to cc/bcc arrays (issue #102)', async () => {
     const client = createMockGmailClient({
       getMessage: vi.fn().mockResolvedValue({

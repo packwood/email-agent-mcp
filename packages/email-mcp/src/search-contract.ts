@@ -1,6 +1,6 @@
 import type { EmailMessage } from '@usejunior/email-core';
 
-export const SEARCH_SCOPES = ['any', 'participants', 'subject', 'body'] as const;
+export const SEARCH_SCOPES = ['all-visible', 'any', 'participants', 'subject', 'body'] as const;
 export type SearchScope = typeof SEARCH_SCOPES[number];
 
 export type MatchClassification =
@@ -11,6 +11,7 @@ export type MatchClassification =
 export interface DeterministicSearchInput {
   query: string;
   searchScope: SearchScope;
+  verificationTerm?: string;
   receivedAfter?: string;
   receivedBefore?: string;
 }
@@ -48,6 +49,9 @@ export function buildProviderSearchQuery(
   if (providerType === 'gmail') {
     const literal = quoteGmailLiteral(query);
     switch (input.searchScope) {
+      case 'all-visible':
+        effective = literal;
+        break;
       case 'participants':
         effective = `{from:${literal} to:${literal} cc:${literal} bcc:${literal}}`;
         break;
@@ -73,6 +77,9 @@ export function buildProviderSearchQuery(
 
   const literal = kqlLiteral(query);
   switch (input.searchScope) {
+    case 'all-visible':
+      effective = `(participants:(${literal}) OR subject:(${literal}) OR body:(${literal}))`;
+      break;
     case 'participants':
       effective = `participants:(${literal})`;
       break;
@@ -100,6 +107,7 @@ export function buildProviderSearchQuery(
 
 export function canonicalEffectiveQuery(input: DeterministicSearchInput): string {
   const parts = [`scope=${input.searchScope}`, `query=${JSON.stringify(input.query)}`];
+  if (input.verificationTerm) parts.push(`verification_term=${JSON.stringify(input.verificationTerm)}`);
   if (input.receivedAfter) parts.push(`received_after=${input.receivedAfter}`);
   if (input.receivedBefore) parts.push(`received_before=${input.receivedBefore}`);
   return parts.join('; ');
@@ -150,11 +158,14 @@ export function classifyMatch(message: EmailMessage, query: string): MatchEviden
   const matchedFields = [...new Set(fields
     .filter(([, value]) => normalize(value).includes(needle))
     .map(([field]) => field))];
+  if (normalize(visibleBody(message)).includes(needle)) matchedFields.push('body');
   if (matchedFields.length > 0) {
-    return { matchClassification: 'verified-header', matchedFields };
-  }
-  if (normalize(visibleBody(message)).includes(needle)) {
-    return { matchClassification: 'verified-visible-body', matchedFields: ['body'] };
+    return {
+      matchClassification: matchedFields.some(field => field !== 'body')
+        ? 'verified-header'
+        : 'verified-visible-body',
+      matchedFields,
+    };
   }
   return { matchClassification: 'unexplained-provider-hit', matchedFields: [] };
 }
@@ -162,6 +173,7 @@ export function classifyMatch(message: EmailMessage, query: string): MatchEviden
 export function matchesScope(message: EmailMessage, scope: SearchScope, query: string): boolean {
   if (scope === 'any') return true;
   const evidence = classifyMatch(message, query);
+  if (scope === 'all-visible') return evidence.matchedFields.length > 0;
   if (scope === 'participants') {
     return evidence.matchedFields.some(field => ['from', 'to', 'cc', 'bcc'].includes(field));
   }
@@ -183,7 +195,9 @@ export function inReceivedWindow(
 
 export function compareSearchMessages(a: EmailMessage, b: EmailMessage): number {
   const timeDifference = Date.parse(b.receivedAt) - Date.parse(a.receivedAt);
-  return timeDifference !== 0 ? timeDifference : a.id.localeCompare(b.id);
+  if (timeDifference !== 0) return timeDifference;
+  const mailboxDifference = (a.mailbox ?? '').localeCompare(b.mailbox ?? '');
+  return mailboxDifference !== 0 ? mailboxDifference : a.id.localeCompare(b.id);
 }
 
 export function formatAddress(address: { email: string; name?: string }): string {

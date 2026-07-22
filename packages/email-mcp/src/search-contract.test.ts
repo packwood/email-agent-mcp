@@ -40,6 +40,10 @@ describe('deterministic search contract', () => {
     expect(buildProviderSearchQuery('gmail', input)).toContain(
       '{from:"Nala Equities" to:"Nala Equities" cc:"Nala Equities" bcc:"Nala Equities"}',
     );
+    expect(buildProviderSearchQuery('microsoft', {
+      query: 'Nala',
+      searchScope: 'all-visible',
+    })).toBe('(participants:(Nala) OR subject:(Nala) OR body:(Nala))');
     expect(canonicalEffectiveQuery(input)).toBe(
       'scope=participants; query="Nala Equities"; received_after=2026-07-15T17:37:00.000Z; received_before=2026-07-22T17:37:00.000Z',
     );
@@ -54,6 +58,10 @@ describe('deterministic search contract', () => {
       matchClassification: 'verified-visible-body',
       matchedFields: ['body'],
     });
+    expect(classifyMatch(message({ body: 'Discuss Nala tomorrow' }), 'Nala')).toEqual({
+      matchClassification: 'verified-header',
+      matchedFields: ['subject', 'to', 'body'],
+    });
     expect(classifyMatch(message({ subject: 'Update', to: [], body: 'No visible term' }), 'Nala')).toEqual({
       matchClassification: 'unexplained-provider-hit',
       matchedFields: [],
@@ -65,6 +73,7 @@ describe('deterministic search contract', () => {
     expect(matchesScope(participant, 'participants', 'Nala')).toBe(true);
     expect(matchesScope(participant, 'subject', 'Nala')).toBe(false);
     expect(matchesScope(participant, 'body', 'Nala')).toBe(false);
+    expect(matchesScope(participant, 'all-visible', 'Nala')).toBe(true);
     expect(matchesScope(participant, 'any', 'Nala')).toBe(true);
   });
 
@@ -78,6 +87,17 @@ describe('deterministic search contract', () => {
   it('orders equal timestamps by stable message ID', () => {
     const messages = [message({ id: 'b' }), message({ id: 'a' })];
     expect(messages.sort(compareSearchMessages).map(item => item.id)).toEqual(['a', 'b']);
+  });
+
+  it('uses mailbox before ID as the global tie-breaker', () => {
+    const messages = [
+      message({ id: 'a', mailbox: 'z@example.com' }),
+      message({ id: 'z', mailbox: 'a@example.com' }),
+    ];
+    expect(messages.sort(compareSearchMessages).map(item => item.mailbox)).toEqual([
+      'a@example.com',
+      'z@example.com',
+    ]);
   });
 
   it('bounds visible snippets and strips HTML-only markup', () => {

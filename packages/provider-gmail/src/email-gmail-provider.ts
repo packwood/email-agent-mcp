@@ -83,6 +83,23 @@ export interface GmailMessage {
   internalDate?: string;
 }
 
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  concurrency: number,
+  mapper: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let nextIndex = 0;
+  const workers = Array.from({ length: Math.min(concurrency, items.length) }, async () => {
+    while (nextIndex < items.length) {
+      const index = nextIndex++;
+      results[index] = await mapper(items[index]!);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
 export class GmailEmailProvider {
   private client: GmailApiClient;
 
@@ -98,9 +115,7 @@ export class GmailEmailProvider {
 
     const page = await this.listMessageWindow({ labelIds: [label] }, offset, limit);
     if (page.length === 0) return [];
-    const messages = await Promise.all(
-      page.map(m => this.client.getMessage(m.id)),
-    );
+    const messages = await mapWithConcurrency(page, 10, m => this.client.getMessage(m.id));
 
     return messages.map(m => mapGmailMessage(m));
   }
@@ -118,9 +133,7 @@ export class GmailEmailProvider {
   async searchMessages(query: string, _folder?: string, limit?: number, offset?: number): Promise<EmailMessage[]> {
     const page = await this.listMessageWindow({ q: query }, offset ?? 0, limit ?? 50);
     if (page.length === 0) return [];
-    const messages = await Promise.all(
-      page.map(m => this.client.getMessage(m.id)),
-    );
+    const messages = await mapWithConcurrency(page, 10, m => this.client.getMessage(m.id));
     return messages.map(m => mapGmailMessage(m));
   }
 
@@ -506,7 +519,13 @@ function mapGmailMessage(msg: GmailMessage): EmailMessage {
   // on read_email (issue #102).
   const bcc = parseAddressList(getHeader(msg, 'Bcc'));
   const subject = getHeader(msg, 'Subject') ?? '';
-  const date = getHeader(msg, 'Date') ?? new Date(parseInt(msg.internalDate ?? '0', 10)).toISOString();
+  const internalDate = Number(msg.internalDate);
+  const headerDate = getHeader(msg, 'Date');
+  const receivedAt = Number.isFinite(internalDate) && internalDate > 0
+    ? new Date(internalDate).toISOString()
+    : Number.isFinite(Date.parse(headerDate ?? ''))
+      ? new Date(Date.parse(headerDate!)).toISOString()
+      : new Date(0).toISOString();
 
   // RFC 2822 threading headers — needed for reply threading on outgoing mail.
   const messageId = getHeader(msg, 'Message-ID') ?? getHeader(msg, 'Message-Id');
@@ -527,7 +546,7 @@ function mapGmailMessage(msg: GmailMessage): EmailMessage {
     to,
     cc,
     bcc,
-    receivedAt: date,
+    receivedAt,
     isRead: !labels.includes('UNREAD'),
     hasAttachments: attachments.length > 0,
     body,

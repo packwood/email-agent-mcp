@@ -693,7 +693,7 @@ describe('mcp-transport/Lazy Provider State', () => {
       emails: Array<{ id: string; subject: string; mailbox?: string }>;
     };
 
-    expect(personalSearch).toHaveBeenCalledWith('license', undefined, 100, 0, { strict: true });
+    expect(personalSearch).toHaveBeenCalledWith('license', undefined, 1000, 0, { strict: true });
     expect(workSearch).not.toHaveBeenCalled();
     expect(result).toEqual({
       emails: [
@@ -715,7 +715,8 @@ describe('mcp-transport/Lazy Provider State', () => {
       returnedCount: 1,
       isTruncated: false,
       candidateLimitReached: false,
-      effectiveQuery: 'scope=any; query="license"',
+      canonicalQuery: 'scope=any; query="license"',
+      providerQueries: [{ mailbox: 'personal', provider: 'gmail', query: 'license' }],
     });
   });
 
@@ -784,8 +785,8 @@ describe('mcp-transport/Lazy Provider State', () => {
       emails: Array<{ id: string; mailbox?: string }>;
     };
 
-    expect(workSearch).toHaveBeenCalledWith('license', undefined, 100, 0, { strict: true });
-    expect(personalSearch).toHaveBeenCalledWith('license', undefined, 100, 0, { strict: true });
+    expect(workSearch).toHaveBeenCalledWith('license', undefined, 1000, 0, { strict: true });
+    expect(personalSearch).toHaveBeenCalledWith('license', undefined, 1000, 0, { strict: true });
     expect(result).toEqual({
       emails: [
       {
@@ -820,7 +821,11 @@ describe('mcp-transport/Lazy Provider State', () => {
       returnedCount: 2,
       isTruncated: false,
       candidateLimitReached: false,
-      effectiveQuery: 'scope=any; query="license"',
+      canonicalQuery: 'scope=any; query="license"',
+      providerQueries: [
+        { mailbox: 'personal', provider: 'gmail', query: 'license' },
+        { mailbox: 'work', provider: 'microsoft', query: 'license' },
+      ],
     });
   });
 
@@ -907,13 +912,13 @@ describe('mcp-transport/Lazy Provider State', () => {
       returnedCount: number;
       isTruncated: boolean;
       nextOffset?: number;
-      effectiveQuery: string;
+      canonicalQuery: string;
     };
 
     expect(searchMessages).toHaveBeenCalledWith(
       '(Nala) AND received>=2026-07-14 AND received<=2026-07-24',
       undefined,
-      100,
+      1000,
       0,
       { strict: true },
     );
@@ -926,13 +931,46 @@ describe('mcp-transport/Lazy Provider State', () => {
       matchClassification: 'verified-header',
       matchedFields: ['subject'],
     });
+    expect(result.emails[0]).not.toHaveProperty('snippet');
     expect(result).toMatchObject({
       returnedCount: 2,
       isTruncated: true,
       nextOffset: 2,
       candidateLimitReached: false,
-      effectiveQuery: 'scope=any; query="Nala"; received_after=2026-07-15T00:00:00.000Z; received_before=2026-07-23T00:00:00.000Z',
+      canonicalQuery: 'scope=any; query="Nala"; received_after=2026-07-15T00:00:00.000Z; received_before=2026-07-23T00:00:00.000Z',
     });
+
+    const secondPage = await search.run({}, {
+      query: 'Nala',
+      mailbox: 'work@example.com',
+      limit: 2,
+      offset: 2,
+      received_after: '2026-07-15T00:00:00.000Z',
+      received_before: '2026-07-23T00:00:00.000Z',
+      search_scope: 'any',
+      verify_matches: true,
+    }) as { emails: Array<{ id: string }> };
+    expect([...result.emails, ...secondPage.emails].map(message => message.id)).toEqual(['a', 'b', 'c']);
+
+    searchMessages.mockResolvedValueOnce(Array.from({ length: 1000 }, (_, index) => ({
+      id: `cap-${String(index).padStart(4, '0')}`,
+      subject: 'Nala cap test',
+      from: { email: 'sender@example.com' },
+      to: [],
+      cc: [],
+      bcc: [],
+      receivedAt: `2026-07-22T14:${String(index % 60).padStart(2, '0')}:00.000Z`,
+      isRead: true,
+      hasAttachments: false,
+    })));
+    const capped = await search.run({}, {
+      query: 'Nala',
+      mailbox: 'work@example.com',
+      limit: 1,
+      offset: 0,
+      search_scope: 'all-visible',
+    }) as { candidateLimitReached: boolean; isTruncated: boolean; nextOffset?: number };
+    expect(capped).toMatchObject({ candidateLimitReached: true, isTruncated: true, nextOffset: 1 });
   });
 
   it('Scenario: custom read_email surfaces attachment metadata from the provider', async () => {
