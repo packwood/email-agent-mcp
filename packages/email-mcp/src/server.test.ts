@@ -318,8 +318,8 @@ describe('mcp-transport/Lazy Provider State', () => {
     // No init has been triggered — state is still 'pending'.
     const actions = await buildLazyActions(state, noAllowlist);
 
-    // 5 custom tools + 21 email-core actions = 26 tools, no auth performed.
-    expect(actions.length).toBe(26);
+    // 5 custom tools + 22 email-core actions = 27 tools, no auth performed.
+    expect(actions.length).toBe(27);
     expect(state.status).toBe('pending');
     expect(state.initPromise).toBeNull();
     expect(state.provider).toBeNull();
@@ -328,6 +328,7 @@ describe('mcp-transport/Lazy Provider State', () => {
     expect(tools.map(t => t.name)).toContain('list_emails');
     expect(tools.map(t => t.name)).toContain('get_mailbox_status');
     expect(tools.map(t => t.name)).toContain('list_attachments');
+    expect(tools.map(t => t.name)).toContain('inspect_draft_exact');
     expect(tools.map(t => t.name)).toContain('download_attachment');
     expect(tools.map(t => t.name)).toContain('send_email');
     expect(tools.map(t => t.name)).toContain('list_scheduled_sends');

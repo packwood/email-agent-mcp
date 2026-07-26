@@ -1,5 +1,6 @@
 // Draft actions — create_draft, send_draft, update_draft
 import { z } from 'zod';
+import { createHash } from 'node:crypto';
 import type { EmailAction } from './registry.js';
 import { checkSendAllowlist } from '../security/send-allowlist.js';
 import { checkReplyThreading } from '../security/reply-validation.js';
@@ -322,6 +323,106 @@ export const sendDraftAction: EmailAction<
     } catch (err) {
       return handleProviderError(err, 'SEND_DRAFT_FAILED');
     }
+  },
+};
+
+// --- inspect_draft_exact ---
+
+const InspectDraftExactInput = z.object({
+  draft_id: z.string(),
+  mailbox: z.string().optional(),
+});
+
+const ExactAddress = z.object({
+  email: z.string(),
+  name: z.string().optional(),
+});
+
+const InspectDraftExactOutput = z.object({
+  id: z.string(),
+  to: z.array(ExactAddress),
+  cc: z.array(ExactAddress),
+  bcc: z.array(ExactAddress),
+  subject: z.string(),
+  body: z.string(),
+  bodyHtml: z.string(),
+  threadId: z.string(),
+  attachments: z.array(z.object({
+    id: z.string(),
+    filename: z.string(),
+    mimeType: z.string(),
+    size: z.number(),
+    isInline: z.boolean(),
+    sha256: z.string(),
+  })),
+});
+
+const MAX_APPROVAL_ATTACHMENT_BYTES = 25 * 1024 * 1024;
+const MAX_APPROVAL_ATTACHMENTS_TOTAL_BYTES = 35 * 1024 * 1024;
+
+/**
+ * Return exact persisted draft content for a human-approval fingerprint.
+ *
+ * Unlike read_email, this action does not transform HTML, strip signatures,
+ * truncate content, or omit attachment bytes from the digest. It deliberately
+ * fails closed when any attachment cannot be downloaded.
+ */
+export const inspectDraftExactAction: EmailAction<
+  z.infer<typeof InspectDraftExactInput>,
+  z.infer<typeof InspectDraftExactOutput>
+> = {
+  name: 'inspect_draft_exact',
+  description: 'Inspect exact persisted draft content and attachment byte hashes for approval binding.',
+  input: InspectDraftExactInput,
+  output: InspectDraftExactOutput,
+  annotations: { readOnlyHint: true, destructiveHint: false },
+  run: async (ctx, input) => {
+    const mailboxError = checkMailboxRequired(input.mailbox, ctx.allMailboxes);
+    if (mailboxError) throw new Error(mailboxError.message);
+    const message = await ctx.provider.getMessage(input.draft_id);
+    if (message.id !== input.draft_id) {
+      throw new Error('Draft identity mismatch');
+    }
+    const attachments = [];
+    let totalAttachmentBytes = 0;
+    for (const attachment of message.attachments ?? []) {
+      if (!ctx.provider.downloadAttachment) {
+        throw new Error(`Cannot fingerprint attachment bytes: ${attachment.filename}`);
+      }
+      if (attachment.size > MAX_APPROVAL_ATTACHMENT_BYTES) {
+        throw new Error(`Attachment exceeds approval fingerprint limit: ${attachment.filename}`);
+      }
+      const downloaded = await ctx.provider.downloadAttachment(message.id, attachment.id);
+      if (downloaded.content.length > MAX_APPROVAL_ATTACHMENT_BYTES) {
+        throw new Error(`Attachment exceeds approval fingerprint limit: ${attachment.filename}`);
+      }
+      totalAttachmentBytes += downloaded.content.length;
+      if (totalAttachmentBytes > MAX_APPROVAL_ATTACHMENTS_TOTAL_BYTES) {
+        throw new Error('Attachments exceed total approval fingerprint limit');
+      }
+      attachments.push({
+        id: attachment.id,
+        filename: attachment.filename,
+        mimeType: attachment.mimeType,
+        size: downloaded.content.length,
+        isInline: attachment.isInline,
+        sha256: createHash('sha256').update(downloaded.content).digest('hex'),
+      });
+    }
+    attachments.sort((a, b) =>
+      `${a.filename}\0${a.id}`.localeCompare(`${b.filename}\0${b.id}`),
+    );
+    return {
+      id: message.id,
+      to: message.to,
+      cc: message.cc ?? [],
+      bcc: message.bcc ?? [],
+      subject: message.subject,
+      body: message.body ?? '',
+      bodyHtml: message.bodyHtml ?? '',
+      threadId: message.threadId ?? message.conversationId ?? '',
+      attachments,
+    };
   },
 };
 

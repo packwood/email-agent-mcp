@@ -63,7 +63,12 @@ export {
   getSearchEmailThreadFields,
 } from './actions/search.js';
 export { replyToEmailAction } from './actions/reply.js';
-export { createDraftAction, sendDraftAction, updateDraftAction } from './actions/draft.js';
+export {
+  createDraftAction,
+  inspectDraftExactAction,
+  sendDraftAction,
+  updateDraftAction,
+} from './actions/draft.js';
 export {
   cancelScheduledSendAction,
   listScheduledSendsAction,
