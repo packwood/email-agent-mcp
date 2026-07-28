@@ -58,6 +58,16 @@ function createMockGmailClient(overrides: Partial<GmailApiClient> = {}): GmailAp
 }
 
 describe('provider-gmail/Message Mapping', () => {
+  it('resolves a Gmail draft resource id through the explicit draft capability', async () => {
+    const client = createMockGmailClient();
+    const provider = new GmailEmailProvider(client);
+
+    const message = await provider.getDraftMessage('r7990141845669078914');
+
+    expect(client.getMessage).toHaveBeenCalledWith('r7990141845669078914');
+    expect(message.id).toBe('msg-1');
+  });
+
   it('Scenario: Gmail message to EmailMessage', async () => {
     const client = createMockGmailClient();
     const provider = new GmailEmailProvider(client);

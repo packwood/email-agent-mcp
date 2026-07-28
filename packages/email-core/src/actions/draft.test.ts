@@ -59,6 +59,8 @@ describe('email-write/Inspect Draft Exact', () => {
     const result = await inspectDraftExactAction.run(ctx, {
       draft_id: 'draft-exact',
     });
+    expect(result.draftId).toBe('draft-exact');
+    expect(result.messageId).toBe('draft-exact');
     expect(result.to).toEqual([{ email: 'to@example.com' }]);
     expect(result.cc).toEqual([{ email: 'cc@example.com' }]);
     expect(result.bcc).toEqual([{ email: 'bcc@example.com' }]);
@@ -69,6 +71,70 @@ describe('email-write/Inspect Draft Exact', () => {
       size: content.length,
       sha256: createHash('sha256').update(content).digest('hex'),
     });
+  });
+
+  it('preserves a Gmail draft resource id separately from its backing message id', async () => {
+    provider.getDraftMessage = vi.fn(async (id) => {
+      expect(id).toBe('r7990141845669078914');
+      return {
+        id: 'message-1',
+        to: [{ email: 'to@example.com' }],
+        cc: [],
+        bcc: [],
+        subject: 'Gmail draft',
+        body: 'plain',
+        from: { email: 'me@example.com' },
+        receivedAt: new Date().toISOString(),
+        isRead: true,
+        hasAttachments: true,
+        attachments: [{
+          id: 'att-1',
+          filename: 'proof.txt',
+          mimeType: 'text/plain',
+          size: 5,
+          isInline: false,
+        }],
+      };
+    });
+    const download = vi.spyOn(provider, 'downloadAttachment').mockImplementation(
+      async (messageId, attachmentId) => {
+        expect(messageId).toBe('message-1');
+        expect(attachmentId).toBe('att-1');
+        return {
+          filename: 'proof.txt',
+          mimeType: 'text/plain',
+          content: Buffer.from('proof'),
+        };
+      },
+    );
+
+    const result = await inspectDraftExactAction.run(ctx, {
+      draft_id: 'r7990141845669078914',
+    });
+
+    expect(result.draftId).toBe('r7990141845669078914');
+    expect(result.messageId).toBe('message-1');
+    expect(result.subject).toBe('Gmail draft');
+    expect(result.attachments[0]?.sha256).toBe(
+      createHash('sha256').update('proof').digest('hex'),
+    );
+    expect(download).toHaveBeenCalledOnce();
+  });
+
+  it('rejects a mismatched message id from a provider without distinct draft ids', async () => {
+    vi.spyOn(provider, 'getMessage').mockResolvedValue({
+      id: 'different-message',
+      to: [{ email: 'to@example.com' }],
+      subject: 'Wrong draft',
+      from: { email: 'me@example.com' },
+      receivedAt: new Date().toISOString(),
+      isRead: true,
+      hasAttachments: false,
+    });
+
+    await expect(inspectDraftExactAction.run(ctx, {
+      draft_id: 'outlook-draft-id',
+    })).rejects.toThrow('Draft identity mismatch');
   });
 
   it('fails closed before downloading an oversized attachment', async () => {

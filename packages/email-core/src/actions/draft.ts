@@ -339,7 +339,8 @@ const ExactAddress = z.object({
 });
 
 const InspectDraftExactOutput = z.object({
-  id: z.string(),
+  draftId: z.string(),
+  messageId: z.string(),
   to: z.array(ExactAddress),
   cc: z.array(ExactAddress),
   bcc: z.array(ExactAddress),
@@ -379,8 +380,11 @@ export const inspectDraftExactAction: EmailAction<
   run: async (ctx, input) => {
     const mailboxError = checkMailboxRequired(input.mailbox, ctx.allMailboxes);
     if (mailboxError) throw new Error(mailboxError.message);
-    const message = await ctx.provider.getMessage(input.draft_id);
-    if (message.id !== input.draft_id) {
+    const resolvesDistinctDraftIds = ctx.provider.getDraftMessage !== undefined;
+    const message = resolvesDistinctDraftIds
+      ? await ctx.provider.getDraftMessage!(input.draft_id)
+      : await ctx.provider.getMessage(input.draft_id);
+    if (!resolvesDistinctDraftIds && message.id !== input.draft_id) {
       throw new Error('Draft identity mismatch');
     }
     const attachments = [];
@@ -413,7 +417,8 @@ export const inspectDraftExactAction: EmailAction<
       `${a.filename}\0${a.id}`.localeCompare(`${b.filename}\0${b.id}`),
     );
     return {
-      id: message.id,
+      draftId: input.draft_id,
+      messageId: message.id,
       to: message.to,
       cc: message.cc ?? [],
       bcc: message.bcc ?? [],

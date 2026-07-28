@@ -130,6 +130,10 @@ export class GmailEmailProvider {
     return mapGmailMessage(draft.message);
   }
 
+  async getDraftMessage(draftId: string): Promise<EmailMessage> {
+    return this.getDraft(draftId);
+  }
+
   async searchMessages(query: string, _folder?: string, limit?: number, offset?: number): Promise<EmailMessage[]> {
     const page = await this.listMessageWindow({ q: query }, offset ?? 0, limit ?? 50);
     if (page.length === 0) return [];
