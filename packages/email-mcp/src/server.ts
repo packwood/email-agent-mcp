@@ -533,7 +533,15 @@ function resolveMailboxContext(
 export async function initProvider(state: LazyProviderState): Promise<void> {
   try {
     const [
-      { listConfiguredMailboxesWithMetadata, DelegatedAuthManager, RealGraphApiClient, GraphEmailProvider },
+      {
+        listConfiguredMailboxesWithMetadata,
+        DelegatedAuthManager,
+        RealGraphApiClient,
+        MatonGraphApiClient,
+        loadMatonOutlookConnections,
+        resolveMatonOutlookConnection,
+        GraphEmailProvider,
+      },
       {
         listConfiguredGmailMailboxes,
         GmailAuthManager,
@@ -559,8 +567,14 @@ export async function initProvider(state: LazyProviderState): Promise<void> {
       ? parseMatonGmailAccounts(process.env['EMAIL_AGENT_MCP_MATON_GMAIL_ACCOUNTS'])
       : [];
     const gmailMailboxes = gmailMatonMode ? [] : await listConfiguredGmailMailboxes();
+    const microsoftTransport = process.env['EMAIL_AGENT_MCP_MICROSOFT_TRANSPORT'];
+    if (microsoftTransport && microsoftTransport !== 'oauth' && microsoftTransport !== 'maton') {
+      throw new Error(`Unsupported Microsoft transport: ${microsoftTransport}`);
+    }
+    const microsoftMatonMode = microsoftTransport === 'maton';
     const matonConnectionsPath = process.env['EMAIL_AGENT_MCP_MATON_CONNECTIONS_PATH'];
     const matonApiKey = process.env['MATON_API_KEY'];
+
     let matonGmailConnections = null;
     let matonGmailSetupError: Error | null = null;
     if (gmailMatonMode) {
@@ -577,6 +591,25 @@ export async function initProvider(state: LazyProviderState): Promise<void> {
         );
       } catch (err) {
         matonGmailSetupError = err instanceof Error ? err : new Error(String(err));
+      }
+    }
+
+    let matonOutlookConnections = null;
+    let matonOutlookSetupError: Error | null = null;
+    if (microsoftMatonMode) {
+      try {
+        if (!matonConnectionsPath) {
+          throw new Error('EMAIL_AGENT_MCP_MATON_CONNECTIONS_PATH is required for Maton transport');
+        }
+        if (!matonApiKey) {
+          throw new Error('MATON_API_KEY is required for Maton transport');
+        }
+        matonOutlookConnections = await loadMatonOutlookConnections(
+          matonConnectionsPath,
+          microsoftMailboxes.flatMap(metadata => metadata.emailAddress ? [metadata.emailAddress] : []),
+        );
+      } catch (err) {
+        matonOutlookSetupError = err instanceof Error ? err : new Error(String(err));
       }
     }
 
@@ -599,18 +632,32 @@ export async function initProvider(state: LazyProviderState): Promise<void> {
     for (const metadata of microsoftMailboxes) {
       const displayName = metadata.emailAddress ?? metadata.mailboxName;
       try {
-        const auth = new DelegatedAuthManager(
-          { mode: 'delegated', clientId: metadata.clientId, tenantId: metadata.tenantId },
-          metadata.mailboxName,
-        );
-        await auth.reconnect();
-        const client = new RealGraphApiClient(() => auth.getAccessToken(), () => auth.tryReconnect());
+        let client;
+        let mailboxAuth: LazyProviderAuth;
+        if (microsoftMatonMode) {
+          if (matonOutlookSetupError) throw matonOutlookSetupError;
+          if (!metadata.emailAddress) {
+            throw new Error(`Microsoft mailbox "${metadata.mailboxName}" has no email address`);
+          }
+          const connection = resolveMatonOutlookConnection(matonOutlookConnections!, metadata.emailAddress);
+          client = new MatonGraphApiClient(matonApiKey!, connection.connectionId);
+          mailboxAuth = {
+            getTokenHealthWarning: () => undefined,
+            tryReconnect: async () => false,
+          };
+        } else {
+          const auth = new DelegatedAuthManager(
+            { mode: 'delegated', clientId: metadata.clientId, tenantId: metadata.tenantId },
+            metadata.mailboxName,
+          );
+          await auth.reconnect();
+          client = new RealGraphApiClient(() => auth.getAccessToken(), () => auth.tryReconnect());
+          mailboxAuth = {
+            getTokenHealthWarning: () => auth.getTokenHealthWarning(),
+            tryReconnect: () => auth.tryReconnect(),
+          };
+        }
         const provider = new GraphEmailProvider(client);
-
-        const mailboxAuth = {
-          getTokenHealthWarning: () => auth.getTokenHealthWarning(),
-          tryReconnect: () => auth.tryReconnect(),
-        };
 
         connectedMailboxes.push({
           name: metadata.mailboxName,
@@ -623,7 +670,9 @@ export async function initProvider(state: LazyProviderState): Promise<void> {
           status: 'connected',
         });
 
-        console.error(`[email-agent-mcp] Connected to mailbox "${displayName}" (${metadata.clientId})`);
+        console.error(
+          `[email-agent-mcp] Connected to mailbox "${displayName}" via ${microsoftMatonMode ? 'Maton' : 'OAuth'}`,
+        );
       } catch (err) {
         failedMailboxes.push({
           name: metadata.mailboxName,
