@@ -89,6 +89,7 @@ const ISO_TIMESTAMP = z.string().refine(
   'must be an ISO-8601 timestamp with an explicit UTC offset',
 );
 const MAX_SEARCH_CANDIDATES = 1000;
+const MAX_GMAIL_SEARCH_CANDIDATES = 100;
 const MAX_SEARCH_OFFSET = 10_000;
 const SEARCH_SNAPSHOT_TTL_MS = 5 * 60 * 1000;
 const MAX_SEARCH_SNAPSHOTS = 24;
@@ -1198,10 +1199,13 @@ export async function buildLazyActions(
         if (!snapshot) {
           const fetched = await Promise.all(mailboxes.map(async mailbox => {
             const providerQuery = buildProviderSearchQuery(mailbox.providerType, searchInput);
+            const candidateLimit = mailbox.providerType === 'gmail'
+              ? MAX_GMAIL_SEARCH_CANDIDATES
+              : MAX_SEARCH_CANDIDATES;
             const mailboxResults = await mailbox.provider.searchMessages(
               providerQuery,
               undefined,
-              MAX_SEARCH_CANDIDATES,
+              candidateLimit,
               0,
               { strict: true },
             );
@@ -1209,7 +1213,7 @@ export async function buildLazyActions(
               mailbox: mailbox.name,
               providerQuery: { mailbox: mailbox.name, provider: mailbox.providerType, query: providerQuery },
               messages: mailboxResults,
-              candidateLimitReached: mailboxResults.length === MAX_SEARCH_CANDIDATES,
+              candidateLimitReached: mailboxResults.length === candidateLimit,
             };
           }));
           const verificationTerm = searchInput.verificationTerm ?? searchInput.query;

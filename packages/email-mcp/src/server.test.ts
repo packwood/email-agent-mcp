@@ -694,7 +694,7 @@ describe('mcp-transport/Lazy Provider State', () => {
       emails: Array<{ id: string; subject: string; mailbox?: string }>;
     };
 
-    expect(personalSearch).toHaveBeenCalledWith('license', undefined, 1000, 0, { strict: true });
+    expect(personalSearch).toHaveBeenCalledWith('license', undefined, 100, 0, { strict: true });
     expect(workSearch).not.toHaveBeenCalled();
     expect(result).toEqual({
       emails: [
@@ -787,7 +787,7 @@ describe('mcp-transport/Lazy Provider State', () => {
     };
 
     expect(workSearch).toHaveBeenCalledWith('license', undefined, 1000, 0, { strict: true });
-    expect(personalSearch).toHaveBeenCalledWith('license', undefined, 1000, 0, { strict: true });
+    expect(personalSearch).toHaveBeenCalledWith('license', undefined, 100, 0, { strict: true });
     expect(result).toEqual({
       emails: [
       {

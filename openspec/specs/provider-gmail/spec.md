@@ -112,3 +112,23 @@ The system SHALL follow Gmail pagination only when the next URL remains HTTPS on
 #### Scenario: Untrusted Gmail pagination URL
 - **WHEN** a Maton Gmail response supplies a next URL outside the trusted gateway and Gmail path prefix
 - **THEN** the request fails without transmitting credentials to that URL
+
+### Requirement: Maton Gmail Rate-Limit Safety
+
+The system SHALL pace all Maton Gmail requests through one shared gateway budget below the documented account limit, SHALL retry only read-only requests after HTTP 429 using bounded backoff, and SHALL never retry a mutation automatically.
+
+#### Scenario: Concurrent Gmail message hydration
+- **WHEN** a list or search result requires multiple message-detail requests
+- **THEN** requests across all configured Gmail mailboxes are paced below the shared Maton account request ceiling
+
+#### Scenario: Deterministic Gmail search snapshot
+- **WHEN** deterministic search builds a Gmail candidate snapshot
+- **THEN** it hydrates at most 100 candidates and reports candidate-limit truncation when that bound is reached
+
+#### Scenario: Read request is rate limited
+- **WHEN** Maton returns HTTP 429 for a Gmail GET request
+- **THEN** the request is retried a bounded number of times and honors a valid Retry-After value
+
+#### Scenario: Mutation request is rate limited
+- **WHEN** Maton returns HTTP 429 for a Gmail mutation
+- **THEN** the failure is returned without an automatic retry
