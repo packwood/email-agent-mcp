@@ -34,7 +34,7 @@ const DRAFT_ORIGIN_HEADER = 'X-Agent-Draft-Origin';
 type DraftOrigin = 'reply' | 'non_reply';
 
 export interface GmailApiClient {
-  listMessages(opts: { labelIds?: string[]; maxResults?: number; q?: string }): Promise<{ messages?: Array<{ id: string; threadId: string }>; resultSizeEstimate?: number }>;
+  listMessages(opts: { labelIds?: string[]; maxResults?: number; q?: string; pageToken?: string }): Promise<{ messages?: Array<{ id: string; threadId: string }>; resultSizeEstimate?: number; nextPageToken?: string }>;
   getMessage(id: string): Promise<GmailMessage>;
   getDraft(draftId: string): Promise<{ id: string; message: GmailMessage }>;
   getAttachment(messageId: string, attachmentId: string): Promise<{ data?: string; size?: number }>;
@@ -83,6 +83,23 @@ export interface GmailMessage {
   internalDate?: string;
 }
 
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  concurrency: number,
+  mapper: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let nextIndex = 0;
+  const workers = Array.from({ length: Math.min(concurrency, items.length) }, async () => {
+    while (nextIndex < items.length) {
+      const index = nextIndex++;
+      results[index] = await mapper(items[index]!);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
 export class GmailEmailProvider {
   private client: GmailApiClient;
 
@@ -96,17 +113,9 @@ export class GmailEmailProvider {
     const limit = opts.limit ?? 25;
     const offset = opts.offset ?? 0;
 
-    const response = await this.client.listMessages({
-      labelIds: [label],
-      maxResults: offset + limit,
-    });
-
-    if (!response.messages?.length) return [];
-
-    const page = response.messages.slice(offset);
-    const messages = await Promise.all(
-      page.map(m => this.client.getMessage(m.id)),
-    );
+    const page = await this.listMessageWindow({ labelIds: [label] }, offset, limit);
+    if (page.length === 0) return [];
+    const messages = await mapWithConcurrency(page, 10, m => this.client.getMessage(m.id));
 
     return messages.map(m => mapGmailMessage(m));
   }
@@ -121,15 +130,42 @@ export class GmailEmailProvider {
     return mapGmailMessage(draft.message);
   }
 
-  async searchMessages(query: string, _folder?: string, limit?: number, offset?: number): Promise<EmailMessage[]> {
-    const response = await this.client.listMessages({ q: query, maxResults: (offset ?? 0) + (limit ?? 50) });
-    if (!response.messages?.length) return [];
+  async getDraftMessage(draftId: string): Promise<EmailMessage> {
+    return this.getDraft(draftId);
+  }
 
-    const page = response.messages.slice(offset ?? 0);
-    const messages = await Promise.all(
-      page.map(m => this.client.getMessage(m.id)),
-    );
+  async searchMessages(query: string, _folder?: string, limit?: number, offset?: number): Promise<EmailMessage[]> {
+    const page = await this.listMessageWindow({ q: query }, offset ?? 0, limit ?? 50);
+    if (page.length === 0) return [];
+    const messages = await mapWithConcurrency(page, 10, m => this.client.getMessage(m.id));
     return messages.map(m => mapGmailMessage(m));
+  }
+
+  private async listMessageWindow(
+    opts: { labelIds?: string[]; q?: string },
+    offset: number,
+    limit: number,
+  ): Promise<Array<{ id: string; threadId: string }>> {
+    const target = offset + limit;
+    const collected: Array<{ id: string; threadId: string }> = [];
+    const visitedTokens = new Set<string>();
+    let pageToken: string | undefined;
+
+    while (collected.length < target) {
+      const response = await this.client.listMessages({
+        ...opts,
+        maxResults: Math.min(500, Math.max(1, target - collected.length)),
+        ...(pageToken ? { pageToken } : {}),
+      });
+      collected.push(...(response.messages ?? []));
+      const next = response.nextPageToken;
+      if (!next) break;
+      if (visitedTokens.has(next)) throw new Error('Gmail message pagination did not terminate');
+      visitedTokens.add(next);
+      pageToken = next;
+    }
+
+    return collected.slice(offset, target);
   }
 
   async getThread(messageId: string): Promise<EmailThread> {
@@ -487,7 +523,13 @@ function mapGmailMessage(msg: GmailMessage): EmailMessage {
   // on read_email (issue #102).
   const bcc = parseAddressList(getHeader(msg, 'Bcc'));
   const subject = getHeader(msg, 'Subject') ?? '';
-  const date = getHeader(msg, 'Date') ?? new Date(parseInt(msg.internalDate ?? '0', 10)).toISOString();
+  const internalDate = Number(msg.internalDate);
+  const headerDate = getHeader(msg, 'Date');
+  const receivedAt = Number.isFinite(internalDate) && internalDate > 0
+    ? new Date(internalDate).toISOString()
+    : Number.isFinite(Date.parse(headerDate ?? ''))
+      ? new Date(Date.parse(headerDate!)).toISOString()
+      : new Date(0).toISOString();
 
   // RFC 2822 threading headers — needed for reply threading on outgoing mail.
   const messageId = getHeader(msg, 'Message-ID') ?? getHeader(msg, 'Message-Id');
@@ -508,7 +550,7 @@ function mapGmailMessage(msg: GmailMessage): EmailMessage {
     to,
     cc,
     bcc,
-    receivedAt: date,
+    receivedAt,
     isRead: !labels.includes('UNREAD'),
     hasAttachments: attachments.length > 0,
     body,

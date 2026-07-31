@@ -25,6 +25,7 @@ import type {
   ScheduledSendResult,
   EmailScheduledSender,
   DraftReplyStatus,
+  SearchProviderOptions,
 } from '@usejunior/email-core';
 import { AttachmentNotSupportedError, AttachmentNotFoundError, ProviderError } from '@usejunior/email-core';
 
@@ -237,6 +238,7 @@ const MESSAGE_SELECT = [
   // default projection already carries it there.
   'isDraft',
 ].join(',');
+const MAX_ATTACHMENT_COUNT = 500;
 
 // Graph message and attachment IDs are base64url-flavored and routinely contain
 // `=`, `+`, `/`, `_`, `-`. Path segments must encode `+`, `/`, and `=` or Graph
@@ -249,6 +251,26 @@ function encodeGraphPathId(id: string): string {
 export interface DeltaResult {
   messages: EmailMessage[];
   nextDeltaLink: string;
+}
+
+function trustedGraphUrl(url: string): string {
+  const fullUrl = url.startsWith('/') ? `https://graph.microsoft.com/v1.0${url}` : url;
+  let parsed: URL;
+  try {
+    parsed = new URL(fullUrl);
+  } catch {
+    throw new Error('Untrusted Microsoft Graph URL');
+  }
+  if (
+    parsed.protocol !== 'https:' ||
+    parsed.hostname !== 'graph.microsoft.com' ||
+    parsed.port !== '' ||
+    parsed.username !== '' ||
+    parsed.password !== ''
+  ) {
+    throw new Error('Untrusted Microsoft Graph URL');
+  }
+  return parsed.toString();
 }
 
 /**
@@ -279,8 +301,8 @@ export class RealGraphApiClient implements GraphApiClient {
   }
 
   async get(url: string): Promise<{ value?: unknown[]; [key: string]: unknown }> {
+    const fullUrl = trustedGraphUrl(url);
     const token = await this.getToken();
-    const fullUrl = url.startsWith('http') ? url : `https://graph.microsoft.com/v1.0${url}`;
     const resp = await this.fetchWithAuthRetry(fullUrl, {
       headers: { Authorization: `Bearer ${token}` },
     });
@@ -291,8 +313,8 @@ export class RealGraphApiClient implements GraphApiClient {
   }
 
   async post(url: string, body?: unknown): Promise<{ id?: string; [key: string]: unknown }> {
+    const fullUrl = trustedGraphUrl(url);
     const token = await this.getToken();
-    const fullUrl = url.startsWith('http') ? url : `https://graph.microsoft.com/v1.0${url}`;
     const headers: Record<string, string> = { Authorization: `Bearer ${token}` };
     const init: RequestInit = { method: 'POST', headers };
     if (body !== undefined) {
@@ -310,8 +332,8 @@ export class RealGraphApiClient implements GraphApiClient {
   }
 
   async patch(url: string, body: unknown): Promise<void> {
+    const fullUrl = trustedGraphUrl(url);
     const token = await this.getToken();
-    const fullUrl = url.startsWith('http') ? url : `https://graph.microsoft.com/v1.0${url}`;
     const resp = await this.fetchWithAuthRetry(fullUrl, {
       method: 'PATCH',
       headers: {
@@ -326,8 +348,8 @@ export class RealGraphApiClient implements GraphApiClient {
   }
 
   async delete(url: string): Promise<void> {
+    const fullUrl = trustedGraphUrl(url);
     const token = await this.getToken();
-    const fullUrl = url.startsWith('http') ? url : `https://graph.microsoft.com/v1.0${url}`;
     const resp = await this.fetchWithAuthRetry(fullUrl, {
       method: 'DELETE',
       headers: { Authorization: `Bearer ${token}` },
@@ -380,6 +402,9 @@ export class GraphEmailProvider implements EmailReader, EmailSender, EmailSchedu
 
     try {
       const response = await this.client.get(expandedUrl) as unknown as GraphMessage;
+      if ((response.attachments?.length ?? 0) > MAX_ATTACHMENT_COUNT) {
+        throw new Error(`Attachment count exceeds ${MAX_ATTACHMENT_COUNT}`);
+      }
       return mapGraphMessage(response);
     } catch (err) {
       // Some mailboxes reject nested $select inside $expand; fall back to a
@@ -390,17 +415,19 @@ export class GraphEmailProvider implements EmailReader, EmailSender, EmailSchedu
     const message = await this.client.get(
       `${this.basePath}/messages/${encodedId}?$select=${MESSAGE_SELECT}`,
     ) as unknown as GraphMessage;
-    const attachments = await this.client.get(
-      `${this.basePath}/messages/${encodedId}/attachments?$select=${ATTACHMENT_SELECT}`,
-    );
-
-    return mapGraphMessage({
-      ...message,
-      attachments: ((attachments.value ?? []) as GraphAttachment[]),
-    });
+    return {
+      ...mapGraphMessage(message),
+      attachments: await this.listAttachments(id),
+    };
   }
 
-  async searchMessages(query: string, folder?: string, limit?: number, offset?: number): Promise<EmailMessage[]> {
+  async searchMessages(
+    query: string,
+    folder?: string,
+    limit?: number,
+    offset?: number,
+    options?: SearchProviderOptions,
+  ): Promise<EmailMessage[]> {
     if (!query || !query.trim()) return [];
 
     const params = new URLSearchParams();
@@ -417,7 +444,7 @@ export class GraphEmailProvider implements EmailReader, EmailSender, EmailSchedu
       return ((response.value ?? []) as GraphMessage[]).map(mapGraphMessage);
     } catch (err) {
       // On HTTP 400 (syntax error), retry with simplified keywords
-      if (err instanceof GraphApiError && err.status === 400) {
+      if (!options?.strict && err instanceof GraphApiError && err.status === 400) {
         const simplified = simplifySearchQuery(query);
         if (simplified && simplified !== query) {
           const retryParams = new URLSearchParams();
@@ -457,7 +484,7 @@ export class GraphEmailProvider implements EmailReader, EmailSender, EmailSchedu
       while (url) {
         if (visitedUrls.size >= maxPages || visitedUrls.has(url)) {
           console.warn(
-            `[GraphEmailProvider] getThread hit pagination safety limit for conversation ${conversationId}; returning ${graphMessages.length} messages fetched so far`,
+            `[GraphEmailProvider] getThread hit pagination safety limit; returning ${graphMessages.length} messages fetched so far`,
           );
           truncated = true;
           break;
@@ -498,10 +525,25 @@ export class GraphEmailProvider implements EmailReader, EmailSender, EmailSchedu
   // want metadata without bytes (e.g. `list_attachments`); downloadAttachment
   // does its own single-call fetch and does not preflight through this method.
   async listAttachments(messageId: string): Promise<EmailAttachment[]> {
-    const response = await this.client.get(
-      `${this.basePath}/messages/${encodeGraphPathId(messageId)}/attachments?$select=${ATTACHMENT_SELECT}`,
-    );
-    return ((response.value ?? []) as GraphAttachment[]).map(a => ({
+    const attachments: GraphAttachment[] = [];
+    const visitedUrls = new Set<string>();
+    const maxPages = 100;
+    let url: string | undefined =
+      `${this.basePath}/messages/${encodeGraphPathId(messageId)}/attachments?$select=${ATTACHMENT_SELECT}`;
+    while (url) {
+      if (visitedUrls.size >= maxPages || visitedUrls.has(url)) {
+        throw new Error(`Attachment pagination did not terminate for message ${messageId}`);
+      }
+      visitedUrls.add(url);
+      const response = await this.client.get(url) as { value?: GraphAttachment[]; '@odata.nextLink'?: string };
+      const page = response.value ?? [];
+      if (attachments.length + page.length > MAX_ATTACHMENT_COUNT) {
+        throw new Error(`Attachment count exceeds ${MAX_ATTACHMENT_COUNT} for message`);
+      }
+      attachments.push(...page);
+      url = response['@odata.nextLink'];
+    }
+    return attachments.map(a => ({
       id: a.id,
       filename: a.name ?? '',
       mimeType: a.contentType ?? 'application/octet-stream',

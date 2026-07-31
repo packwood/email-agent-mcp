@@ -2,8 +2,14 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { writeFile, mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { createHash } from 'node:crypto';
 import { MockEmailProvider } from '../testing/mock-provider.js';
-import { createDraftAction, sendDraftAction, updateDraftAction } from './draft.js';
+import {
+  createDraftAction,
+  inspectDraftExactAction,
+  sendDraftAction,
+  updateDraftAction,
+} from './draft.js';
 import { sendEmailAction } from './send.js';
 import { replyToEmailAction } from './reply.js';
 import { buildDraftPreview, PREVIEW_BODY_LIMIT } from './compose-helpers.js';
@@ -24,6 +30,134 @@ beforeEach(async () => {
     sendAllowlist: { entries: ['*@allowed.com'] },
     safeDir: testDir,
   };
+});
+
+describe('email-write/Inspect Draft Exact', () => {
+  it('binds recipient roles, raw bodies, and attachment bytes', async () => {
+    const content = Buffer.from('attachment bytes');
+    provider.addMessage({
+      id: 'draft-exact',
+      to: [{ email: 'to@example.com' }],
+      cc: [{ email: 'cc@example.com' }],
+      bcc: [{ email: 'bcc@example.com' }],
+      subject: 'Exact',
+      body: 'plain',
+      bodyHtml: '<b>plain</b>',
+      from: { email: 'me@example.com' },
+      receivedAt: new Date().toISOString(),
+      isRead: true,
+      hasAttachments: true,
+      attachments: [{
+        id: 'att-1',
+        filename: 'proof.txt',
+        mimeType: 'text/plain',
+        size: content.length,
+        isInline: false,
+      }],
+    });
+    provider.addAttachmentData('draft-exact', 'att-1', content);
+    const result = await inspectDraftExactAction.run(ctx, {
+      draft_id: 'draft-exact',
+    });
+    expect(result.draftId).toBe('draft-exact');
+    expect(result.messageId).toBe('draft-exact');
+    expect(result.to).toEqual([{ email: 'to@example.com' }]);
+    expect(result.cc).toEqual([{ email: 'cc@example.com' }]);
+    expect(result.bcc).toEqual([{ email: 'bcc@example.com' }]);
+    expect(result.body).toBe('plain');
+    expect(result.bodyHtml).toBe('<b>plain</b>');
+    expect(result.attachments[0]).toMatchObject({
+      filename: 'proof.txt',
+      size: content.length,
+      sha256: createHash('sha256').update(content).digest('hex'),
+    });
+  });
+
+  it('preserves a Gmail draft resource id separately from its backing message id', async () => {
+    provider.getDraftMessage = vi.fn(async (id) => {
+      expect(id).toBe('r7990141845669078914');
+      return {
+        id: 'message-1',
+        to: [{ email: 'to@example.com' }],
+        cc: [],
+        bcc: [],
+        subject: 'Gmail draft',
+        body: 'plain',
+        from: { email: 'me@example.com' },
+        receivedAt: new Date().toISOString(),
+        isRead: true,
+        hasAttachments: true,
+        attachments: [{
+          id: 'att-1',
+          filename: 'proof.txt',
+          mimeType: 'text/plain',
+          size: 5,
+          isInline: false,
+        }],
+      };
+    });
+    const download = vi.spyOn(provider, 'downloadAttachment').mockImplementation(
+      async (messageId, attachmentId) => {
+        expect(messageId).toBe('message-1');
+        expect(attachmentId).toBe('att-1');
+        return {
+          filename: 'proof.txt',
+          mimeType: 'text/plain',
+          content: Buffer.from('proof'),
+        };
+      },
+    );
+
+    const result = await inspectDraftExactAction.run(ctx, {
+      draft_id: 'r7990141845669078914',
+    });
+
+    expect(result.draftId).toBe('r7990141845669078914');
+    expect(result.messageId).toBe('message-1');
+    expect(result.subject).toBe('Gmail draft');
+    expect(result.attachments[0]?.sha256).toBe(
+      createHash('sha256').update('proof').digest('hex'),
+    );
+    expect(download).toHaveBeenCalledOnce();
+  });
+
+  it('rejects a mismatched message id from a provider without distinct draft ids', async () => {
+    vi.spyOn(provider, 'getMessage').mockResolvedValue({
+      id: 'different-message',
+      to: [{ email: 'to@example.com' }],
+      subject: 'Wrong draft',
+      from: { email: 'me@example.com' },
+      receivedAt: new Date().toISOString(),
+      isRead: true,
+      hasAttachments: false,
+    });
+
+    await expect(inspectDraftExactAction.run(ctx, {
+      draft_id: 'outlook-draft-id',
+    })).rejects.toThrow('Draft identity mismatch');
+  });
+
+  it('fails closed before downloading an oversized attachment', async () => {
+    provider.addMessage({
+      id: 'draft-oversized',
+      to: [{ email: 'to@example.com' }],
+      subject: 'Oversized',
+      from: { email: 'me@example.com' },
+      receivedAt: new Date().toISOString(),
+      isRead: true,
+      hasAttachments: true,
+      attachments: [{
+        id: 'att-large',
+        filename: 'large.bin',
+        mimeType: 'application/octet-stream',
+        size: 25 * 1024 * 1024 + 1,
+        isInline: false,
+      }],
+    });
+    await expect(inspectDraftExactAction.run(ctx, {
+      draft_id: 'draft-oversized',
+    })).rejects.toThrow('Attachment exceeds approval fingerprint limit');
+  });
 });
 
 describe('email-write/Create Draft', () => {

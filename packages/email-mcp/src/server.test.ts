@@ -318,8 +318,8 @@ describe('mcp-transport/Lazy Provider State', () => {
     // No init has been triggered — state is still 'pending'.
     const actions = await buildLazyActions(state, noAllowlist);
 
-    // 5 custom tools + 21 email-core actions = 26 tools, no auth performed.
-    expect(actions.length).toBe(26);
+    // 5 custom tools + 22 email-core actions = 27 tools, no auth performed.
+    expect(actions.length).toBe(27);
     expect(state.status).toBe('pending');
     expect(state.initPromise).toBeNull();
     expect(state.provider).toBeNull();
@@ -328,6 +328,7 @@ describe('mcp-transport/Lazy Provider State', () => {
     expect(tools.map(t => t.name)).toContain('list_emails');
     expect(tools.map(t => t.name)).toContain('get_mailbox_status');
     expect(tools.map(t => t.name)).toContain('list_attachments');
+    expect(tools.map(t => t.name)).toContain('inspect_draft_exact');
     expect(tools.map(t => t.name)).toContain('download_attachment');
     expect(tools.map(t => t.name)).toContain('send_email');
     expect(tools.map(t => t.name)).toContain('list_scheduled_sends');
@@ -634,6 +635,9 @@ describe('mcp-transport/Lazy Provider State', () => {
         id: 'work-1',
         subject: 'Work result',
         from: { email: 'boss@example.com' },
+        to: [],
+        cc: [],
+        bcc: [],
         receivedAt: '2026-04-09T10:00:00.000Z',
         isRead: false,
         hasAttachments: false,
@@ -645,6 +649,9 @@ describe('mcp-transport/Lazy Provider State', () => {
         id: 'personal-1',
         subject: 'Personal result',
         from: { email: 'friend@example.com' },
+        to: [],
+        cc: [],
+        bcc: [],
         receivedAt: '2026-04-09T11:00:00.000Z',
         isRead: true,
         hasAttachments: true,
@@ -687,13 +694,17 @@ describe('mcp-transport/Lazy Provider State', () => {
       emails: Array<{ id: string; subject: string; mailbox?: string }>;
     };
 
-    expect(personalSearch).toHaveBeenCalledWith('license', undefined, 25, undefined);
+    expect(personalSearch).toHaveBeenCalledWith('license', undefined, 100, 0, { strict: true });
     expect(workSearch).not.toHaveBeenCalled();
-    expect(result.emails).toEqual([
+    expect(result).toEqual({
+      emails: [
       {
         id: 'personal-1',
         subject: 'Personal result',
         from: 'friend@example.com',
+        to: [],
+        cc: [],
+        bcc: [],
         receivedAt: '2026-04-09T11:00:00.000Z',
         isRead: true,
         hasAttachments: true,
@@ -701,7 +712,13 @@ describe('mcp-transport/Lazy Provider State', () => {
         threadId: 'gmail-thread-xyz',
         isDraft: false,
       },
-    ]);
+      ],
+      returnedCount: 1,
+      isTruncated: false,
+      candidateLimitReached: false,
+      canonicalQuery: 'scope=any; query="license"',
+      providerQueries: [{ mailbox: 'personal', provider: 'gmail', query: 'license' }],
+    });
   });
 
   it('Scenario: custom search_emails can fan out across all connected mailboxes', async () => {
@@ -710,6 +727,9 @@ describe('mcp-transport/Lazy Provider State', () => {
         id: 'work-1',
         subject: 'Work result',
         from: { email: 'boss@example.com' },
+        to: [],
+        cc: [],
+        bcc: [],
         receivedAt: '2026-04-09T10:00:00.000Z',
         isRead: false,
         hasAttachments: false,
@@ -721,6 +741,9 @@ describe('mcp-transport/Lazy Provider State', () => {
         id: 'personal-1',
         subject: 'Personal result',
         from: { email: 'friend@example.com' },
+        to: [],
+        cc: [],
+        bcc: [],
         receivedAt: '2026-04-09T11:00:00.000Z',
         isRead: true,
         hasAttachments: true,
@@ -763,13 +786,17 @@ describe('mcp-transport/Lazy Provider State', () => {
       emails: Array<{ id: string; mailbox?: string }>;
     };
 
-    expect(workSearch).toHaveBeenCalledWith('license', undefined);
-    expect(personalSearch).toHaveBeenCalledWith('license', undefined);
-    expect(result.emails).toEqual([
+    expect(workSearch).toHaveBeenCalledWith('license', undefined, 1000, 0, { strict: true });
+    expect(personalSearch).toHaveBeenCalledWith('license', undefined, 100, 0, { strict: true });
+    expect(result).toEqual({
+      emails: [
       {
         id: 'personal-1',
         subject: 'Personal result',
         from: 'friend@example.com',
+        to: [],
+        cc: [],
+        bcc: [],
         receivedAt: '2026-04-09T11:00:00.000Z',
         isRead: true,
         hasAttachments: true,
@@ -781,6 +808,9 @@ describe('mcp-transport/Lazy Provider State', () => {
         id: 'work-1',
         subject: 'Work result',
         from: 'boss@example.com',
+        to: [],
+        cc: [],
+        bcc: [],
         receivedAt: '2026-04-09T10:00:00.000Z',
         isRead: false,
         hasAttachments: false,
@@ -788,7 +818,254 @@ describe('mcp-transport/Lazy Provider State', () => {
         conversationId: 'graph-conversation-abc',
         isDraft: false,
       },
+      ],
+      returnedCount: 2,
+      isTruncated: false,
+      candidateLimitReached: false,
+      canonicalQuery: 'scope=any; query="license"',
+      providerQueries: [
+        { mailbox: 'personal', provider: 'gmail', query: 'license' },
+        { mailbox: 'work', provider: 'microsoft', query: 'license' },
+      ],
+    });
+  });
+
+  it('Scenario: deterministic search applies exact window, stable sort, and evidence', async () => {
+    const searchMessages = vi.fn().mockResolvedValue([
+      {
+        id: 'b',
+        subject: 'Nala update',
+        from: { email: 'sender@example.com' },
+        to: [],
+        cc: [],
+        bcc: [],
+        receivedAt: '2026-07-22T15:00:00.000Z',
+        isRead: false,
+        hasAttachments: false,
+        body: 'Visible text',
+      },
+      {
+        id: 'a',
+        subject: 'Other update',
+        from: { email: 'sender@example.com' },
+        to: [{ email: 'agustin@nalaequities.com' }],
+        cc: [],
+        bcc: [],
+        receivedAt: '2026-07-22T15:00:00.000Z',
+        isRead: true,
+        hasAttachments: false,
+        body: 'Visible text',
+      },
+      {
+        id: 'c',
+        subject: 'Other update',
+        from: { email: 'sender@example.com' },
+        to: [],
+        cc: [],
+        bcc: [],
+        receivedAt: '2026-07-22T14:00:00.000Z',
+        isRead: true,
+        hasAttachments: false,
+        body: 'Provider-only indexed content',
+      },
+      {
+        id: 'old',
+        subject: 'Nala old',
+        from: { email: 'sender@example.com' },
+        to: [],
+        cc: [],
+        bcc: [],
+        receivedAt: '2026-07-14T15:00:00.000Z',
+        isRead: true,
+        hasAttachments: false,
+      },
     ]);
+    const state = createLazyProviderState();
+    state.status = 'connected';
+    state.initPromise = Promise.resolve();
+    state.provider = { searchMessages } as never;
+    state.connectedMailbox = 'work@example.com';
+    state.connectedProvider = 'microsoft';
+    state.mailboxes = [{
+      name: 'work',
+      emailAddress: 'work@example.com',
+      displayName: 'work@example.com',
+      providerType: 'microsoft',
+      provider: { searchMessages } as never,
+      auth: null,
+      isDefault: true,
+      status: 'connected',
+    }];
+
+    const actions = await buildLazyActions(state, noAllowlist);
+    const search = actions.find(action => action.name === 'search_emails')!;
+    const result = await search.run({}, {
+      query: 'Nala',
+      mailbox: 'work@example.com',
+      limit: 2,
+      offset: 0,
+      received_after: '2026-07-15T00:00:00.000Z',
+      received_before: '2026-07-23T00:00:00.000Z',
+      search_scope: 'any',
+      verify_matches: true,
+      verification_term: 'Nala',
+    }) as {
+      emails: Array<{ id: string; matchClassification: string; matchedFields: string[] }>;
+      returnedCount: number;
+      isTruncated: boolean;
+      nextOffset?: number;
+      canonicalQuery: string;
+      searchSnapshot: string;
+    };
+
+    expect(searchMessages).toHaveBeenCalledWith(
+      '(Nala) AND received>=2026-07-14 AND received<=2026-07-24',
+      undefined,
+      1000,
+      0,
+      { strict: true },
+    );
+    expect(result.emails.map(message => message.id)).toEqual(['a', 'b']);
+    expect(result.emails[0]).toMatchObject({
+      matchClassification: 'verified-header',
+      matchedFields: ['to'],
+    });
+    expect(result.emails[1]).toMatchObject({
+      matchClassification: 'verified-header',
+      matchedFields: ['subject'],
+    });
+    expect(result.emails[0]).not.toHaveProperty('snippet');
+    expect(result).toMatchObject({
+      returnedCount: 2,
+      isTruncated: true,
+      nextOffset: 2,
+      candidateLimitReached: false,
+      canonicalQuery: 'scope=any; query="Nala"; verification_term="Nala"; received_after=2026-07-15T00:00:00.000Z; received_before=2026-07-23T00:00:00.000Z',
+    });
+
+    const secondPage = await search.run({}, {
+      query: 'Nala',
+      mailbox: 'work@example.com',
+      limit: 2,
+      offset: 2,
+      search_snapshot: result.searchSnapshot,
+      received_after: '2026-07-15T00:00:00.000Z',
+      received_before: '2026-07-23T00:00:00.000Z',
+      search_scope: 'any',
+      verify_matches: true,
+      verification_term: 'Nala',
+    }) as { emails: Array<{ id: string }> };
+    expect([...result.emails, ...secondPage.emails].map(message => message.id)).toEqual(['a', 'b', 'c']);
+    expect(searchMessages).toHaveBeenCalledTimes(1);
+
+    searchMessages.mockResolvedValueOnce(Array.from({ length: 1000 }, (_, index) => ({
+      id: `cap-${String(index).padStart(4, '0')}`,
+      subject: 'Nala cap test',
+      from: { email: 'sender@example.com' },
+      to: [],
+      cc: [],
+      bcc: [],
+      receivedAt: `2026-07-22T14:${String(index % 60).padStart(2, '0')}:00.000Z`,
+      isRead: true,
+      hasAttachments: false,
+    })));
+    const capped = await search.run({}, {
+      query: 'Nala',
+      mailbox: 'work@example.com',
+      limit: 1,
+      offset: 0,
+      search_scope: 'all-visible',
+    }) as { candidateLimitReached: boolean; isTruncated: boolean; nextOffset?: number; searchSnapshot: string };
+    expect(capped).toMatchObject({ candidateLimitReached: true, isTruncated: true, nextOffset: 1 });
+    const terminalCappedPage = await search.run({}, {
+      query: 'Nala',
+      mailbox: 'work@example.com',
+      limit: 1,
+      offset: 999,
+      search_scope: 'all-visible',
+      search_snapshot: capped.searchSnapshot,
+    }) as { candidateLimitReached: boolean; isTruncated: boolean; nextOffset?: number };
+    expect(terminalCappedPage).toMatchObject({ candidateLimitReached: true, isTruncated: true });
+    expect(terminalCappedPage).not.toHaveProperty('nextOffset');
+    expect(searchMessages).toHaveBeenCalledTimes(2);
+    await expect(search.run({}, {
+      query: 'Other',
+      mailbox: 'work@example.com',
+      limit: 1,
+      offset: 1,
+      search_scope: 'all-visible',
+      search_snapshot: capped.searchSnapshot,
+    })).rejects.toThrow(/SEARCH_SNAPSHOT_INVALID/);
+    await expect(search.run({}, {
+      query: 'Nala',
+      mailbox: 'work@example.com',
+      limit: 1,
+      offset: 1,
+      search_scope: 'all-visible',
+      search_snapshot: '123e4567-e89b-42d3-a456-426614174000',
+    })).rejects.toThrow(/SEARCH_SNAPSHOT_INVALID/);
+
+    searchMessages.mockResolvedValueOnce([
+      {
+        id: 'large-a',
+        subject: 'Large result',
+        from: { email: 'sender@example.com' },
+        to: [], cc: [], bcc: [],
+        receivedAt: '2026-07-22T15:00:00.000Z',
+        isRead: true,
+        hasAttachments: false,
+        body: 'x'.repeat(9 * 1024 * 1024),
+      },
+      {
+        id: 'large-b',
+        subject: 'Large result',
+        from: { email: 'sender@example.com' },
+        to: [], cc: [], bcc: [],
+        receivedAt: '2026-07-22T14:00:00.000Z',
+        isRead: true,
+        hasAttachments: false,
+        body: 'x'.repeat(9 * 1024 * 1024),
+      },
+    ]);
+    const largeBodyResult = await search.run({}, {
+      query: 'Large',
+      mailbox: 'work@example.com',
+      limit: 1,
+      search_scope: 'all-visible',
+    }) as { searchSnapshot: string };
+    expect(JSON.stringify(largeBodyResult).length).toBeLessThan(10_000);
+
+    let bodyReads = 0;
+    searchMessages.mockResolvedValueOnce([{
+      id: 'metadata-only',
+      subject: 'Metadata only',
+      from: { email: 'sender@example.com' },
+      to: [], cc: [], bcc: [],
+      receivedAt: '2026-07-22T15:00:00.000Z',
+      isRead: true,
+      hasAttachments: false,
+      get body() {
+        bodyReads += 1;
+        return 'Body must remain untouched';
+      },
+    }]);
+    await search.run({}, {
+      query: 'native-query',
+      mailbox: 'work@example.com',
+      search_scope: 'any',
+    });
+    expect(bodyReads).toBe(0);
+    await expect(search.run({}, {
+      query: 'Nala',
+      mailbox: 'work@example.com',
+      offset: 1,
+    })).rejects.toThrow(/SEARCH_SNAPSHOT_REQUIRED/);
+    await expect(search.run({}, {
+      query: 'Nala',
+      mailbox: 'work@example.com',
+      search_scope: 'all-visible',
+      verification_term: 'the',
+    })).rejects.toThrow(/verification_term is only valid/);
   });
 
   it('Scenario: custom read_email surfaces attachment metadata from the provider', async () => {

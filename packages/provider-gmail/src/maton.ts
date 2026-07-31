@@ -1,8 +1,12 @@
 import { readFile } from 'node:fs/promises';
 import type { GmailApiClient, GmailMessage } from './email-gmail-provider.js';
 
-const MATON_GMAIL_ROOT = 'https://gateway.maton.ai/google-mail/gmail/v1';
+const MATON_GMAIL_ROOT = 'https://api.maton.ai/google-mail/gmail/v1';
 const DEFAULT_DEADLINE_MS = 90_000;
+const DEFAULT_MIN_REQUEST_INTERVAL_MS = 250;
+const MAX_READ_ATTEMPTS = 4;
+let sharedRequestGate: Promise<void> = Promise.resolve();
+let sharedNextRequestAt = 0;
 
 interface MatonConnectionRecord {
   app?: unknown;
@@ -169,19 +173,49 @@ export class MatonGmailApiClient implements GmailApiClient {
     private readonly apiKey: string,
     private readonly connectionId: string,
     private readonly deadlineMs = DEFAULT_DEADLINE_MS,
+    private readonly minRequestIntervalMs = DEFAULT_MIN_REQUEST_INTERVAL_MS,
   ) {
     if (!apiKey) throw new Error('MATON_API_KEY is required for Gmail transport');
     assertConnectionId(connectionId, 'configured mailbox');
     if (!Number.isSafeInteger(deadlineMs) || deadlineMs < 1 || deadlineMs > 300_000) {
       throw new Error('Invalid Maton request deadline');
     }
+    if (!Number.isSafeInteger(minRequestIntervalMs) || minRequestIntervalMs < 0 || minRequestIntervalMs > 10_000) {
+      throw new Error('Invalid Maton request interval');
+    }
+  }
+
+  private async paceRequest(): Promise<void> {
+    let release!: () => void;
+    const previous = sharedRequestGate;
+    sharedRequestGate = new Promise<void>(resolve => { release = resolve; });
+    await previous;
+    try {
+      const delayMs = Math.max(0, sharedNextRequestAt - Date.now());
+      if (delayMs > 0) await new Promise(resolve => setTimeout(resolve, delayMs));
+      sharedNextRequestAt = Date.now() + this.minRequestIntervalMs;
+    } finally {
+      release();
+    }
+  }
+
+  private readRetryDelay(response: Response, attempt: number): number {
+    const retryAfter = response.headers.get('retry-after');
+    if (retryAfter) {
+      const seconds = Number(retryAfter);
+      if (Number.isFinite(seconds) && seconds >= 0) return Math.min(30_000, seconds * 1000);
+      const date = Date.parse(retryAfter);
+      if (Number.isFinite(date)) return Math.min(30_000, Math.max(0, date - Date.now()));
+    }
+    const cap = Math.min(8_000, 500 * 2 ** attempt);
+    return Math.floor(Math.random() * cap);
   }
 
   private async request<T>(path: string, method: string, body?: unknown): Promise<T> {
     const url = new URL(`${MATON_GMAIL_ROOT}${path}`);
     if (
       url.protocol !== 'https:' ||
-      url.hostname !== 'gateway.maton.ai' ||
+      url.hostname !== 'api.maton.ai' ||
       url.port !== '' ||
       url.username !== '' ||
       url.password !== '' ||
@@ -202,8 +236,17 @@ export class MatonGmailApiClient implements GmailApiClient {
       headers['Content-Type'] = 'application/json';
       init.body = JSON.stringify(body);
     }
-    const response = await fetch(url, init);
-    const text = await response.text();
+    const attempts = method === 'GET' ? MAX_READ_ATTEMPTS : 1;
+    let response!: Response;
+    let text = '';
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      await this.paceRequest();
+      response = await fetch(url, init);
+      text = await response.text();
+      if (response.status !== 429 || attempt === attempts - 1) break;
+      const delayMs = this.readRetryDelay(response, attempt);
+      if (delayMs > 0) await new Promise(resolve => setTimeout(resolve, delayMs));
+    }
     if (!response.ok) {
       let message = text.slice(0, 500) || response.statusText || 'request failed';
       try {

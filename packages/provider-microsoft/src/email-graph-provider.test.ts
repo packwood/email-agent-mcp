@@ -250,6 +250,11 @@ describe('provider-microsoft/Message Mapping', () => {
             size: 245000,
             isInline: false,
           },
+        ],
+        '@odata.nextLink': 'https://graph.microsoft.com/v1.0/me/messages/msg-attachments/attachments?page=2',
+      },
+      {
+        value: [
           {
             id: 'att-inline',
             name: 'inline.png',
@@ -294,6 +299,10 @@ describe('provider-microsoft/Message Mapping', () => {
     expect(client.get).toHaveBeenNthCalledWith(
       3,
       '/me/messages/msg-attachments/attachments?$select=id,name,contentType,size,isInline,microsoft.graph.fileAttachment/contentId',
+    );
+    expect(client.get).toHaveBeenNthCalledWith(
+      4,
+      'https://graph.microsoft.com/v1.0/me/messages/msg-attachments/attachments?page=2',
     );
   });
 
@@ -435,6 +444,53 @@ describe('provider-microsoft/Attachment Download', () => {
     expect(client.get).toHaveBeenCalledWith(
       '/me/messages/msg-1/attachments?$select=id,name,contentType,size,isInline,microsoft.graph.fileAttachment/contentId',
     );
+  });
+
+  it('follows every attachment collection page', async () => {
+    const client = createSchemaValidatingClient([
+      {
+        value: [{ id: 'att-1', name: 'one.txt', contentType: 'text/plain', size: 1 }],
+        '@odata.nextLink': 'https://graph.microsoft.com/v1.0/me/messages/msg-1/attachments?page=2',
+      },
+      {
+        value: [{ id: 'att-2', name: 'two.txt', contentType: 'text/plain', size: 2 }],
+      },
+    ]);
+    const provider = new GraphEmailProvider(client);
+
+    const attachments = await provider.listAttachments('msg-1');
+
+    expect(attachments.map(attachment => attachment.id)).toEqual(['att-1', 'att-2']);
+    expect(client.get).toHaveBeenNthCalledWith(
+      2,
+      'https://graph.microsoft.com/v1.0/me/messages/msg-1/attachments?page=2',
+    );
+  });
+
+  it('fails instead of returning a partial attachment collection on a looping nextLink', async () => {
+    const loop = 'https://graph.microsoft.com/v1.0/me/messages/msg-1/attachments?page=loop';
+    const client = createSchemaValidatingClient([
+      { value: [], '@odata.nextLink': loop },
+      { value: [], '@odata.nextLink': loop },
+    ]);
+    const provider = new GraphEmailProvider(client);
+
+    await expect(provider.listAttachments('msg-1')).rejects.toThrow(/pagination did not terminate/);
+  });
+
+  it('fails during pagination before accumulating more than 500 attachments', async () => {
+    const attachment = (id: string) => ({ id, name: `${id}.txt`, contentType: 'text/plain', size: 1 });
+    const client = createSchemaValidatingClient([
+      {
+        value: Array.from({ length: 400 }, (_, index) => attachment(`a-${index}`)),
+        '@odata.nextLink': 'https://graph.microsoft.com/v1.0/me/messages/msg-1/attachments?page=2',
+      },
+      { value: Array.from({ length: 101 }, (_, index) => attachment(`b-${index}`)) },
+    ]);
+    const provider = new GraphEmailProvider(client);
+
+    await expect(provider.listAttachments('msg-1')).rejects.toThrow(/Attachment count exceeds 500/);
+    expect(client.get).toHaveBeenCalledTimes(2);
   });
 
   it('Scenario: downloadAttachment decodes contentBytes and uses the fileAttachment $select cast', async () => {
@@ -1903,6 +1959,21 @@ describe('provider-microsoft/Graph API Client', () => {
 
     vi.unstubAllGlobals();
   });
+
+  it('rejects untrusted absolute URLs before retrieving or sending a bearer token', async () => {
+    const getToken = vi.fn().mockResolvedValue('token-123');
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+    const client = new RealGraphApiClient(getToken);
+
+    await expect(client.get('https://attacker.example/steal')).rejects.toThrow(/Untrusted Microsoft Graph URL/);
+    await expect(client.get('http://graph.microsoft.com/v1.0/me')).rejects.toThrow(/Untrusted Microsoft Graph URL/);
+    await expect(client.get('https://graph.microsoft.com.evil.example/v1.0/me')).rejects.toThrow(/Untrusted Microsoft Graph URL/);
+    expect(getToken).not.toHaveBeenCalled();
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    vi.unstubAllGlobals();
+  });
 });
 
 describe('provider-microsoft/Graph API Auth Retry', () => {
@@ -2172,6 +2243,21 @@ describe('provider-microsoft/Search Hardening', () => {
     // Simplified query should not contain field prefixes or boolean operators
     expect(retryUrl).not.toContain('from%3A');
     expect(retryUrl).not.toContain('AND');
+  });
+
+  it('Scenario: Strict search fails closed instead of silently broadening', async () => {
+    const error = new GraphApiError(400, 'Bad Request: syntax error');
+    const client = createMockClient({ get: vi.fn().mockRejectedValue(error) });
+    const provider = new GraphEmailProvider(client);
+
+    await expect(provider.searchMessages(
+      'participants:(Nala) AND received>=2026-07-14',
+      undefined,
+      25,
+      0,
+      { strict: true },
+    )).rejects.toBe(error);
+    expect(client.get).toHaveBeenCalledTimes(1);
   });
 
   it('Scenario: simplifySearchQuery strips prefixes and operators', () => {

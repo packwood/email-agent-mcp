@@ -58,6 +58,16 @@ function createMockGmailClient(overrides: Partial<GmailApiClient> = {}): GmailAp
 }
 
 describe('provider-gmail/Message Mapping', () => {
+  it('resolves a Gmail draft resource id through the explicit draft capability', async () => {
+    const client = createMockGmailClient();
+    const provider = new GmailEmailProvider(client);
+
+    const message = await provider.getDraftMessage('r7990141845669078914');
+
+    expect(client.getDraft).toHaveBeenCalledWith('r7990141845669078914');
+    expect(message.id).toBe('msg-draft');
+  });
+
   it('Scenario: Gmail message to EmailMessage', async () => {
     const client = createMockGmailClient();
     const provider = new GmailEmailProvider(client);
@@ -108,6 +118,29 @@ describe('provider-gmail/Message Mapping', () => {
 
     expect(msg.isDraft).toBe(false);
     expect(msg.folder).toBe('inbox');
+  });
+
+  it('uses Gmail internalDate as receipt time instead of the sender-controlled Date header', async () => {
+    const client = createMockGmailClient({
+      getMessage: vi.fn().mockResolvedValue({
+        id: 'msg-delayed',
+        threadId: 'thread-delayed',
+        labelIds: ['INBOX'],
+        internalDate: String(new Date('2026-07-22T15:00:00Z').getTime()),
+        payload: {
+          headers: [
+            { name: 'From', value: 'sender@example.com' },
+            { name: 'To', value: 'recipient@example.com' },
+            { name: 'Subject', value: 'Delayed delivery' },
+            { name: 'Date', value: '1999-01-01T00:00:00Z' },
+          ],
+        },
+      }),
+    });
+
+    const msg = await new GmailEmailProvider(client).getMessage('msg-delayed');
+
+    expect(msg.receivedAt).toBe('2026-07-22T15:00:00.000Z');
   });
 
   it('Scenario: Cc and Bcc headers map to cc/bcc arrays (issue #102)', async () => {
@@ -334,6 +367,96 @@ describe('provider-gmail/Label Mapping', () => {
     expect(client.listMessages).toHaveBeenCalledWith(
       expect.objectContaining({ labelIds: ['SPAM'] }),
     );
+  });
+});
+
+describe('provider-gmail/Pagination', () => {
+  it('bounds concurrent Gmail detail reads at ten', async () => {
+    let active = 0;
+    let peak = 0;
+    const client = createMockGmailClient({
+      listMessages: vi.fn().mockResolvedValue({
+        messages: Array.from({ length: 25 }, (_, index) => ({ id: `m-${index}`, threadId: `t-${index}` })),
+      }),
+      getMessage: vi.fn().mockImplementation(async (id: string) => {
+        active += 1;
+        peak = Math.max(peak, active);
+        await new Promise(resolve => setTimeout(resolve, 2));
+        active -= 1;
+        return {
+          id,
+          threadId: id.replace('m-', 't-'),
+          labelIds: ['INBOX'],
+          internalDate: String(new Date('2026-07-21T12:00:00Z').getTime()),
+          payload: { headers: [{ name: 'Subject', value: id }] },
+        };
+      }),
+    });
+
+    const messages = await new GmailEmailProvider(client).searchMessages('bounded', undefined, 25, 0);
+
+    expect(messages).toHaveLength(25);
+    expect(peak).toBe(10);
+  });
+
+  it('follows page tokens until an offset window is complete', async () => {
+    const listMessages = vi.fn()
+      .mockResolvedValueOnce({
+        messages: [
+          { id: 'm-1', threadId: 't-1' },
+          { id: 'm-2', threadId: 't-2' },
+        ],
+        nextPageToken: 'page-2',
+      })
+      .mockResolvedValueOnce({
+        messages: [
+          { id: 'm-3', threadId: 't-3' },
+          { id: 'm-4', threadId: 't-4' },
+        ],
+      });
+    const client = createMockGmailClient({
+      listMessages,
+      getMessage: vi.fn().mockImplementation(async (id: string) => ({
+        id,
+        threadId: `t-${id.slice(2)}`,
+        labelIds: ['INBOX'],
+        payload: {
+          headers: [
+            { name: 'From', value: 'sender@example.com' },
+            { name: 'Subject', value: id },
+            { name: 'Date', value: '2026-07-21T12:00:00Z' },
+          ],
+        },
+        internalDate: String(new Date('2026-07-21T12:00:00Z').getTime()),
+      })),
+    });
+    const provider = new GmailEmailProvider(client);
+
+    const messages = await provider.searchMessages('participant@example.com', undefined, 2, 2);
+
+    expect(messages.map(message => message.id)).toEqual(['m-3', 'm-4']);
+    expect(listMessages).toHaveBeenNthCalledWith(1, {
+      q: 'participant@example.com',
+      maxResults: 4,
+    });
+    expect(listMessages).toHaveBeenNthCalledWith(2, {
+      q: 'participant@example.com',
+      maxResults: 2,
+      pageToken: 'page-2',
+    });
+  });
+
+  it('fails instead of returning partial results when a page token loops', async () => {
+    const client = createMockGmailClient({
+      listMessages: vi.fn().mockResolvedValue({
+        messages: [{ id: 'm-1', threadId: 't-1' }],
+        nextPageToken: 'loop',
+      }),
+    });
+    const provider = new GmailEmailProvider(client);
+
+    await expect(provider.searchMessages('participant@example.com', undefined, 2, 2))
+      .rejects.toThrow(/pagination did not terminate/);
   });
 });
 

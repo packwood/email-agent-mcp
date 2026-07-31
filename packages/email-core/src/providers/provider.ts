@@ -17,8 +17,25 @@ export interface EmailReader {
   listMessages(opts: ListOptions): Promise<EmailMessage[]>;
   getMessage(id: string): Promise<EmailMessage>;
   getDraft?(draftId: string): Promise<EmailMessage>;
-  searchMessages(query: string, folder?: string, limit?: number, offset?: number): Promise<EmailMessage[]>;
+  /**
+   * Resolve a provider draft resource to its backing message when those use
+   * distinct identifiers. Providers without this capability must return the
+   * same id from getMessage(draftId).
+   */
+  getDraftMessage?(draftId: string): Promise<EmailMessage>;
+  searchMessages(
+    query: string,
+    folder?: string,
+    limit?: number,
+    offset?: number,
+    options?: SearchProviderOptions,
+  ): Promise<EmailMessage[]>;
   getThread(messageId: string): Promise<EmailThread>;
+}
+
+export interface SearchProviderOptions {
+  /** Fail closed on provider query syntax errors instead of broadening the query. */
+  strict?: boolean;
 }
 
 export interface EmailSender {

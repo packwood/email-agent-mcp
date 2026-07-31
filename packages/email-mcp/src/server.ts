@@ -1,5 +1,6 @@
 // MCP server — thin transport adapter mapping action registry to MCP tools
 import { createRequire } from 'node:module';
+import { randomUUID } from 'node:crypto';
 import type { DeletePolicy, EmailAction, EmailMessage, EmailProvider } from '@usejunior/email-core';
 import {
   EmailDraftStatusSchema,
@@ -7,6 +8,18 @@ import {
   getEmailDraftStatus,
   getEmailThreadFields,
 } from '@usejunior/email-core';
+import {
+  SEARCH_SCOPES,
+  boundedSnippet,
+  buildProviderSearchQuery,
+  canonicalEffectiveQuery,
+  classifyMatch,
+  formatAddress,
+  inReceivedWindow,
+  matchEvidenceSupportsScope,
+  type DeterministicSearchInput,
+} from './search-contract.js';
+import { SearchSnapshotStore } from './search-snapshot-store.js';
 import { z } from 'zod';
 
 /**
@@ -71,6 +84,41 @@ const MANUAL_GMAIL_SETUP_HINT =
   'or add a Gmail mailbox JSON file under ~/.email-agent-mcp/tokens/. See packages/provider-gmail/README.md';
 const NO_MAILBOX_CONFIGURED_MESSAGE =
   `No mailbox configured — run: email-agent-mcp configure --mailbox <name> --provider microsoft ${MANUAL_GMAIL_SETUP_HINT}`;
+const ISO_TIMESTAMP = z.string().refine(
+  value => Number.isFinite(Date.parse(value)) && /(?:Z|[+-]\d{2}:\d{2})$/.test(value),
+  'must be an ISO-8601 timestamp with an explicit UTC offset',
+);
+const MAX_SEARCH_CANDIDATES = 1000;
+const MAX_GMAIL_SEARCH_CANDIDATES = 100;
+const MAX_SEARCH_OFFSET = 10_000;
+const SEARCH_SNAPSHOT_TTL_MS = 5 * 60 * 1000;
+const MAX_SEARCH_SNAPSHOTS = 24;
+const MAX_SEARCH_SNAPSHOT_BYTES = 8 * 1024 * 1024;
+
+interface CachedSearchRow {
+  id: string;
+  subject: string;
+  from: string;
+  to: string[];
+  cc: string[];
+  bcc: string[];
+  receivedAt: string;
+  isRead: boolean;
+  hasAttachments: boolean;
+  mailbox: string;
+  snippet?: string;
+  matchClassification?: 'verified-header' | 'verified-visible-body' | 'unexplained-provider-hit';
+  matchedFields?: string[];
+  threadId?: string;
+  conversationId?: string;
+  isDraft?: boolean;
+}
+
+interface CachedSearchSnapshot {
+  messages: CachedSearchRow[];
+  candidateLimitReached: boolean;
+  providerQueries: Array<{ mailbox: string; provider: 'microsoft' | 'gmail'; query: string }>;
+}
 
 // Re-export types for the action registry
 export interface McpTool {
@@ -486,7 +534,15 @@ function resolveMailboxContext(
 export async function initProvider(state: LazyProviderState): Promise<void> {
   try {
     const [
-      { listConfiguredMailboxesWithMetadata, DelegatedAuthManager, RealGraphApiClient, GraphEmailProvider },
+      {
+        listConfiguredMailboxesWithMetadata,
+        DelegatedAuthManager,
+        RealGraphApiClient,
+        MatonGraphApiClient,
+        loadMatonOutlookConnections,
+        resolveMatonOutlookConnection,
+        GraphEmailProvider,
+      },
       {
         listConfiguredGmailMailboxes,
         GmailAuthManager,
@@ -512,8 +568,14 @@ export async function initProvider(state: LazyProviderState): Promise<void> {
       ? parseMatonGmailAccounts(process.env['EMAIL_AGENT_MCP_MATON_GMAIL_ACCOUNTS'])
       : [];
     const gmailMailboxes = gmailMatonMode ? [] : await listConfiguredGmailMailboxes();
+    const microsoftTransport = process.env['EMAIL_AGENT_MCP_MICROSOFT_TRANSPORT'];
+    if (microsoftTransport && microsoftTransport !== 'oauth' && microsoftTransport !== 'maton') {
+      throw new Error(`Unsupported Microsoft transport: ${microsoftTransport}`);
+    }
+    const microsoftMatonMode = microsoftTransport === 'maton';
     const matonConnectionsPath = process.env['EMAIL_AGENT_MCP_MATON_CONNECTIONS_PATH'];
     const matonApiKey = process.env['MATON_API_KEY'];
+
     let matonGmailConnections = null;
     let matonGmailSetupError: Error | null = null;
     if (gmailMatonMode) {
@@ -530,6 +592,25 @@ export async function initProvider(state: LazyProviderState): Promise<void> {
         );
       } catch (err) {
         matonGmailSetupError = err instanceof Error ? err : new Error(String(err));
+      }
+    }
+
+    let matonOutlookConnections = null;
+    let matonOutlookSetupError: Error | null = null;
+    if (microsoftMatonMode) {
+      try {
+        if (!matonConnectionsPath) {
+          throw new Error('EMAIL_AGENT_MCP_MATON_CONNECTIONS_PATH is required for Maton transport');
+        }
+        if (!matonApiKey) {
+          throw new Error('MATON_API_KEY is required for Maton transport');
+        }
+        matonOutlookConnections = await loadMatonOutlookConnections(
+          matonConnectionsPath,
+          microsoftMailboxes.flatMap(metadata => metadata.emailAddress ? [metadata.emailAddress] : []),
+        );
+      } catch (err) {
+        matonOutlookSetupError = err instanceof Error ? err : new Error(String(err));
       }
     }
 
@@ -552,18 +633,32 @@ export async function initProvider(state: LazyProviderState): Promise<void> {
     for (const metadata of microsoftMailboxes) {
       const displayName = metadata.emailAddress ?? metadata.mailboxName;
       try {
-        const auth = new DelegatedAuthManager(
-          { mode: 'delegated', clientId: metadata.clientId, tenantId: metadata.tenantId },
-          metadata.mailboxName,
-        );
-        await auth.reconnect();
-        const client = new RealGraphApiClient(() => auth.getAccessToken(), () => auth.tryReconnect());
+        let client;
+        let mailboxAuth: LazyProviderAuth;
+        if (microsoftMatonMode) {
+          if (matonOutlookSetupError) throw matonOutlookSetupError;
+          if (!metadata.emailAddress) {
+            throw new Error(`Microsoft mailbox "${metadata.mailboxName}" has no email address`);
+          }
+          const connection = resolveMatonOutlookConnection(matonOutlookConnections!, metadata.emailAddress);
+          client = new MatonGraphApiClient(matonApiKey!, connection.connectionId);
+          mailboxAuth = {
+            getTokenHealthWarning: () => undefined,
+            tryReconnect: async () => false,
+          };
+        } else {
+          const auth = new DelegatedAuthManager(
+            { mode: 'delegated', clientId: metadata.clientId, tenantId: metadata.tenantId },
+            metadata.mailboxName,
+          );
+          await auth.reconnect();
+          client = new RealGraphApiClient(() => auth.getAccessToken(), () => auth.tryReconnect());
+          mailboxAuth = {
+            getTokenHealthWarning: () => auth.getTokenHealthWarning(),
+            tryReconnect: () => auth.tryReconnect(),
+          };
+        }
         const provider = new GraphEmailProvider(client);
-
-        const mailboxAuth = {
-          getTokenHealthWarning: () => auth.getTokenHealthWarning(),
-          tryReconnect: () => auth.tryReconnect(),
-        };
 
         connectedMailboxes.push({
           name: metadata.mailboxName,
@@ -576,7 +671,9 @@ export async function initProvider(state: LazyProviderState): Promise<void> {
           status: 'connected',
         });
 
-        console.error(`[email-agent-mcp] Connected to mailbox "${displayName}" (${metadata.clientId})`);
+        console.error(
+          `[email-agent-mcp] Connected to mailbox "${displayName}" via ${microsoftMatonMode ? 'Maton' : 'OAuth'}`,
+        );
       } catch (err) {
         failedMailboxes.push({
           name: metadata.mailboxName,
@@ -740,11 +837,17 @@ export async function buildLazyActions(
   // the boundary is intentional and operator-overridable rather than an
   // implicit process.cwd() fallback inside the file loaders.
   const safeDir = process.env.EMAIL_MCP_SAFE_DIR || process.cwd();
+  const searchSnapshots = new SearchSnapshotStore<CachedSearchSnapshot>({
+    ttlMs: SEARCH_SNAPSHOT_TTL_MS,
+    maxEntries: MAX_SEARCH_SNAPSHOTS,
+    maxBytes: MAX_SEARCH_SNAPSHOT_BYTES,
+  });
 
   const {
     sendEmailAction,
     replyToEmailAction,
     createDraftAction,
+    inspectDraftExactAction,
     sendDraftAction,
     updateDraftAction,
     cancelScheduledSendAction,
@@ -948,53 +1051,257 @@ export async function buildLazyActions(
     },
     {
       name: 'search_emails',
-      description: 'Search emails using full-text query across one or all mailboxes. Use offset for pagination. Results include unsent drafts: a row with `isDraft: true` has NOT been sent — its `receivedAt` is provider-supplied metadata, not evidence of delivery. Never describe such a row as a sent, delivered, or received email.',
-      input: z.object({ query: z.string(), mailbox: z.string().nullable().optional(), limit: z.number().optional(), offset: z.number().optional() }),
+      description: 'Search emails deterministically using provider-native discovery, explicit received-time bounds, stable ordering, pagination metadata, and optional observable match evidence. Results can include unsent drafts: `isDraft: true` means the message has NOT been sent.',
+      input: z.object({
+        query: z.string().trim().min(1).max(512),
+        mailbox: z.string().nullable().optional(),
+        limit: z.number().int().min(1).max(100).optional(),
+        offset: z.number().int().min(0).max(MAX_SEARCH_OFFSET).optional(),
+        received_after: ISO_TIMESTAMP.optional(),
+        received_before: ISO_TIMESTAMP.optional(),
+        search_scope: z.enum(SEARCH_SCOPES).optional(),
+        verify_matches: z.boolean().optional(),
+        verification_term: z.string().trim().min(1).max(512).optional(),
+        include_snippet: z.boolean().optional(),
+        search_snapshot: z.string().uuid().optional(),
+      }).superRefine((value, ctx) => {
+        if ((value.offset ?? 0) + (value.limit ?? 25) > MAX_SEARCH_OFFSET + 100) {
+          ctx.addIssue({ code: 'custom', message: 'offset + limit exceeds the search pagination bound' });
+        }
+        if ((value.offset ?? 0) > 0 && !value.search_snapshot) {
+          ctx.addIssue({ code: 'custom', message: 'search_snapshot is required when offset is positive' });
+        }
+        if ((value.search_scope ?? 'any') !== 'any' && value.verification_term !== undefined) {
+          ctx.addIssue({ code: 'custom', message: 'verification_term is only valid with search_scope any' });
+        }
+        if ((value.search_scope ?? 'any') === 'any' && value.verify_matches && !value.verification_term) {
+          ctx.addIssue({ code: 'custom', message: 'verification_term is required to verify a provider-native query' });
+        }
+      }),
       output: z.object({
         emails: z.array(z.object({
           id: z.string(),
           subject: z.string(),
           from: z.string(),
+          to: z.array(z.string()),
+          cc: z.array(z.string()),
+          bcc: z.array(z.string()),
           receivedAt: z.string(),
           isRead: z.boolean(),
           hasAttachments: z.boolean(),
           mailbox: z.string().optional(),
+          snippet: z.string().optional(),
+          matchClassification: z.enum([
+            'verified-header',
+            'verified-visible-body',
+            'unexplained-provider-hit',
+          ]).optional(),
+          matchedFields: z.array(z.string()).optional(),
         }).extend(EmailThreadFieldsSchema.shape).extend(EmailDraftStatusSchema.shape)),
+        returnedCount: z.number(),
+        isTruncated: z.boolean(),
+        nextOffset: z.number().optional(),
+        candidateLimitReached: z.boolean(),
+        canonicalQuery: z.string(),
+        providerQueries: z.array(z.object({
+          mailbox: z.string(),
+          provider: z.enum(['microsoft', 'gmail']),
+          query: z.string(),
+        })),
+        searchSnapshot: z.string().uuid().optional(),
       }),
       annotations: { readOnlyHint: true, destructiveHint: false },
       run: async (_ctx, input) => {
         await waitForInit(state);
-        if (!getDefaultMailbox(state)) return { emails: [] };
-        const inp = input as { query: string; mailbox?: string | null; limit?: number; offset?: number };
+        const inp = input as {
+          query: string;
+          mailbox?: string | null;
+          limit?: number;
+          offset?: number;
+          received_after?: string;
+          received_before?: string;
+          search_scope?: typeof SEARCH_SCOPES[number];
+          verify_matches?: boolean;
+          verification_term?: string;
+          include_snippet?: boolean;
+          search_snapshot?: string;
+        };
+        const limit = inp.limit ?? 25;
+        const offset = inp.offset ?? 0;
+        if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+          throw new Error('SEARCH_LIMIT_INVALID: limit must be an integer from 1 through 100');
+        }
+        if (!Number.isInteger(offset) || offset < 0 || offset > MAX_SEARCH_OFFSET || offset + limit > MAX_SEARCH_OFFSET + 100) {
+          throw new Error('SEARCH_OFFSET_INVALID: offset exceeds the search pagination bound');
+        }
+        if (offset > 0 && !inp.search_snapshot) {
+          throw new Error('SEARCH_SNAPSHOT_REQUIRED: pass the prior page searchSnapshot');
+        }
+        const searchInput: DeterministicSearchInput = {
+          query: inp.query,
+          searchScope: inp.search_scope ?? 'any',
+          verificationTerm: inp.verification_term,
+          receivedAfter: inp.received_after,
+          receivedBefore: inp.received_before,
+        };
+        if (!searchInput.query?.trim() || searchInput.query.length > 512) {
+          throw new Error('SEARCH_QUERY_INVALID: query must contain 1 through 512 characters');
+        }
+        if (searchInput.verificationTerm !== undefined && (
+          !searchInput.verificationTerm.trim() || searchInput.verificationTerm.length > 512
+        )) {
+          throw new Error('SEARCH_VERIFICATION_TERM_INVALID: verification_term must contain 1 through 512 characters');
+        }
+        if (searchInput.searchScope !== 'any' && searchInput.verificationTerm !== undefined) {
+          throw new Error('SEARCH_VERIFICATION_TERM_INVALID: verification_term is only valid with search_scope any');
+        }
+        if (searchInput.searchScope === 'any' && inp.verify_matches && !searchInput.verificationTerm) {
+          throw new Error('SEARCH_VERIFICATION_TERM_REQUIRED: provider-native verification requires verification_term');
+        }
+        for (const [name, value] of [
+          ['received_after', searchInput.receivedAfter],
+          ['received_before', searchInput.receivedBefore],
+        ] as const) {
+          if (value && (!Number.isFinite(Date.parse(value)) || !/(?:Z|[+-]\d{2}:\d{2})$/.test(value))) {
+            throw new Error(`SEARCH_WINDOW_INVALID: ${name} must include an explicit UTC offset`);
+          }
+        }
+        if (
+          searchInput.receivedAfter && searchInput.receivedBefore &&
+          Date.parse(searchInput.receivedAfter) >= Date.parse(searchInput.receivedBefore)
+        ) {
+          throw new Error('SEARCH_WINDOW_INVALID: received_after must precede received_before');
+        }
+        const emptyResult = {
+          emails: [],
+          returnedCount: 0,
+          isTruncated: false,
+          candidateLimitReached: false,
+          canonicalQuery: canonicalEffectiveQuery(searchInput),
+          providerQueries: [],
+        };
+        if (!getDefaultMailbox(state)) return emptyResult;
         const resolved = inp.mailbox === null ? null : resolveMailboxContext(state, inp.mailbox);
-        const results: Array<EmailMessage & { mailbox: string }> = resolved
-          ? (await resolved.mailbox.provider.searchMessages(
-            inp.query,
-            undefined,
-            inp.limit ?? 25,
-            inp.offset,
-          )).map(result => ({ ...result, mailbox: resolved.mailbox.name }))
-          : (await Promise.all(
-            getConnectedMailboxes(state).map(async mailbox => {
-              const mailboxResults = await mailbox.provider.searchMessages(inp.query, undefined);
-              return mailboxResults.map(result => ({ ...result, mailbox: mailbox.name }));
-            }),
-          ))
-            .flat()
-            .sort((a, b) => new Date(b.receivedAt).getTime() - new Date(a.receivedAt).getTime())
-            .slice(inp.offset ?? 0, (inp.offset ?? 0) + (inp.limit ?? 25));
+        const mailboxes = resolved ? [resolved.mailbox] : getConnectedMailboxes(state);
+        const signature = JSON.stringify({
+          mailboxes: mailboxes
+            .map(mailbox => `${mailbox.providerType}:${mailbox.name}:${mailbox.emailAddress}`)
+            .sort(),
+          request: canonicalEffectiveQuery(searchInput),
+          verifyMatches: inp.verify_matches ?? false,
+          includeSnippet: inp.include_snippet ?? false,
+        });
+        let searchSnapshot = inp.search_snapshot;
+        let snapshot = searchSnapshot ? searchSnapshots.get(searchSnapshot, signature) : undefined;
+        if (searchSnapshot && !snapshot) {
+          throw new Error('SEARCH_SNAPSHOT_INVALID: snapshot expired or does not match this request');
+        }
+        if (!snapshot) {
+          const fetched = await Promise.all(mailboxes.map(async mailbox => {
+            const providerQuery = buildProviderSearchQuery(mailbox.providerType, searchInput);
+            const candidateLimit = mailbox.providerType === 'gmail'
+              ? MAX_GMAIL_SEARCH_CANDIDATES
+              : MAX_SEARCH_CANDIDATES;
+            const mailboxResults = await mailbox.provider.searchMessages(
+              providerQuery,
+              undefined,
+              candidateLimit,
+              0,
+              { strict: true },
+            );
+            return {
+              mailbox: mailbox.name,
+              providerQuery: { mailbox: mailbox.name, provider: mailbox.providerType, query: providerQuery },
+              messages: mailboxResults,
+              candidateLimitReached: mailboxResults.length === candidateLimit,
+            };
+          }));
+          const verificationTerm = searchInput.verificationTerm ?? searchInput.query;
+          const includeEvidence = inp.verify_matches === true;
+          const scopeNeedsBody = searchInput.searchScope === 'all-visible' || searchInput.searchScope === 'body';
+          const projected = fetched
+            .flatMap(item => item.messages.map(message => ({ message, mailbox: item.mailbox })))
+            .filter(({ message }) => inReceivedWindow(
+              message,
+              searchInput.receivedAfter,
+              searchInput.receivedBefore,
+            ))
+            .sort((a, b) => {
+              const timeDifference = Date.parse(b.message.receivedAt) - Date.parse(a.message.receivedAt);
+              if (timeDifference !== 0) return timeDifference;
+              const mailboxDifference = a.mailbox.localeCompare(b.mailbox);
+              return mailboxDifference !== 0
+                ? mailboxDifference
+                : a.message.id.localeCompare(b.message.id);
+            })
+            .flatMap(({ message, mailbox }) => {
+              const evidence = searchInput.searchScope !== 'any' || includeEvidence
+                ? classifyMatch(message, verificationTerm, {
+                  includeBody: includeEvidence || scopeNeedsBody,
+                })
+                : undefined;
+              if (
+                searchInput.searchScope !== 'any' &&
+                (!evidence || !matchEvidenceSupportsScope(evidence, searchInput.searchScope))
+              ) {
+                return [];
+              }
+              const snippet = inp.include_snippet ? boundedSnippet(message) : undefined;
+              return [{
+                id: message.id,
+                subject: message.subject,
+                from: formatAddress(message.from),
+                to: (message.to ?? []).map(formatAddress),
+                cc: (message.cc ?? []).map(formatAddress),
+                bcc: (message.bcc ?? []).map(formatAddress),
+                receivedAt: message.receivedAt,
+                isRead: message.isRead,
+                hasAttachments: message.hasAttachments,
+                mailbox,
+                ...(snippet ? { snippet } : {}),
+                ...(includeEvidence && evidence ? evidence : {}),
+                ...getEmailThreadFields(message),
+                ...getEmailDraftStatus(message),
+              }];
+            });
+          const providerQueries = fetched
+            .map(item => item.providerQuery)
+            .sort((a, b) => a.mailbox.localeCompare(b.mailbox));
+          const bytes = Buffer.byteLength(JSON.stringify({ projected, providerQueries }), 'utf8');
+          snapshot = {
+            messages: projected,
+            candidateLimitReached: fetched.some(item => item.candidateLimitReached),
+            providerQueries,
+          };
+          if (projected.length > limit) {
+            searchSnapshot = randomUUID();
+          }
+          if (searchSnapshot) {
+            searchSnapshots.set(searchSnapshot, signature, snapshot, bytes);
+          }
+        }
+        const { messages, candidateLimitReached, providerQueries } = snapshot;
+        const page = messages.slice(offset, offset + limit);
+        const hasKnownNextPage = messages.length > offset + page.length;
+        const isTruncated = candidateLimitReached || hasKnownNextPage;
         return {
-          emails: results.map(m => ({
-            id: m.id,
-            subject: m.subject,
-            from: m.from.name ? `${m.from.name} <${m.from.email}>` : m.from.email,
-            receivedAt: m.receivedAt,
-            isRead: m.isRead,
-            hasAttachments: m.hasAttachments,
-            mailbox: m.mailbox,
-            ...getEmailThreadFields(m),
-            ...getEmailDraftStatus(m),
-          })),
+          emails: page.map(message => {
+            const { snippet, matchClassification, matchedFields, ...row } = message;
+            return {
+              ...row,
+              ...(inp.include_snippet && snippet ? { snippet } : {}),
+              ...(inp.verify_matches ? { matchClassification, matchedFields } : {}),
+            };
+          }),
+          returnedCount: page.length,
+          isTruncated,
+          ...(hasKnownNextPage && page.length > 0
+            ? { nextOffset: offset + page.length }
+            : {}),
+          candidateLimitReached,
+          canonicalQuery: canonicalEffectiveQuery(searchInput),
+          providerQueries: providerQueries.sort((a, b) => a.mailbox.localeCompare(b.mailbox)),
+          ...(searchSnapshot ? { searchSnapshot } : {}),
         };
       },
     },
@@ -1123,6 +1430,7 @@ export async function buildLazyActions(
     wrapAction(sendEmailAction),
     wrapAction(replyToEmailAction),
     wrapAction(createDraftAction),
+    wrapAction(inspectDraftExactAction),
     wrapAction(sendDraftAction),
     wrapAction(updateDraftAction),
     wrapAction(cancelScheduledSendAction),

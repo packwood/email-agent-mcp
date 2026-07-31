@@ -74,7 +74,7 @@ describe('MatonGmailApiClient', () => {
       resultSizeEstimate: 2,
     }), { status: 200 }));
     vi.stubGlobal('fetch', fetchMock);
-    const client = new MatonGmailApiClient('secret-key', 'connection-1', 1000);
+    const client = new MatonGmailApiClient('secret-key', 'connection-1', 1000, 0);
 
     await expect(client.listMessages({
       labelIds: ['INBOX', 'STARRED'],
@@ -89,7 +89,7 @@ describe('MatonGmailApiClient', () => {
     const [url, init] = fetchMock.mock.calls[0]!;
     const parsed = new URL(String(url));
     expect(parsed.origin + parsed.pathname).toBe(
-      'https://gateway.maton.ai/google-mail/gmail/v1/users/me/messages',
+      'https://api.maton.ai/google-mail/gmail/v1/users/me/messages',
     );
     expect(parsed.searchParams.getAll('labelIds')).toEqual(['INBOX', 'STARRED']);
     expect(parsed.searchParams.get('q')).toBe('from:a+b@example.com');
@@ -111,7 +111,7 @@ describe('MatonGmailApiClient', () => {
     ];
     const fetchMock = vi.fn(async () => responses.shift()!);
     vi.stubGlobal('fetch', fetchMock);
-    const client = new MatonGmailApiClient('secret-key', 'connection-1', 1000);
+    const client = new MatonGmailApiClient('secret-key', 'connection-1', 1000, 0);
 
     await expect(client.getMessage('d/1')).resolves.toMatchObject({ id: 'm-draft', threadId: 't-1' });
     await expect(client.getDraft('d/1')).resolves.toMatchObject({
@@ -139,7 +139,7 @@ describe('MatonGmailApiClient', () => {
       { status: 503 },
     ));
     vi.stubGlobal('fetch', fetchMock);
-    const client = new MatonGmailApiClient('secret-key', 'connection-1', 1000);
+    const client = new MatonGmailApiClient('secret-key', 'connection-1', 1000, 0);
 
     await expect(client.sendMessage('raw')).rejects.toThrow('Gmail API error 503');
     expect(fetchMock).toHaveBeenCalledTimes(1);
@@ -149,5 +149,41 @@ describe('MatonGmailApiClient', () => {
       expect(String(err)).not.toContain('secret-key');
       expect(String(err)).not.toContain('connection-1');
     }
+  });
+
+  it('retries a rate-limited read but never a rate-limited mutation', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response('Too Many Requests', {
+        status: 429,
+        headers: { 'Retry-After': '0' },
+      }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ id: 'm-1', threadId: 't-1' }), { status: 200 }))
+      .mockResolvedValueOnce(new Response('Too Many Requests', { status: 429 }));
+    vi.stubGlobal('fetch', fetchMock);
+    const client = new MatonGmailApiClient('secret-key', 'connection-1', 1000, 0);
+
+    await expect(client.getMessage('m-1')).resolves.toMatchObject({ id: 'm-1' });
+    await expect(client.sendMessage('raw')).rejects.toThrow('Gmail API error 429');
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
+  it('paces concurrent requests from different mailboxes through one shared budget', async () => {
+    const started: number[] = [];
+    const fetchMock = vi.fn(async () => {
+      started.push(Date.now());
+      return new Response(JSON.stringify({ id: `m-${started.length}`, threadId: 't-1' }), { status: 200 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const first = new MatonGmailApiClient('secret-key', 'connection-1', 1000, 15);
+    const second = new MatonGmailApiClient('secret-key', 'connection-2', 1000, 15);
+
+    await Promise.all([
+      first.getMessage('m-1'),
+      second.getMessage('m-2'),
+      first.getMessage('m-3'),
+    ]);
+    expect(started).toHaveLength(3);
+    expect(started[1]! - started[0]!).toBeGreaterThanOrEqual(10);
+    expect(started[2]! - started[1]!).toBeGreaterThanOrEqual(10);
   });
 });
