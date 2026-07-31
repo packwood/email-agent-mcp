@@ -19,7 +19,7 @@
     "clean": "rm -rf dist/"
   },
   "dependencies": {
-    "marked": "^18.0.0",
+    "marked": "^18.0.7",
     "node-html-markdown": "^2.0.0",
     "zod": "^4.0.0"
   },

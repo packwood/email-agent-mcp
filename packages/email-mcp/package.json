@@ -20,7 +20,7 @@
   },
   "dependencies": {
     "@clack/prompts": "^1.1.0",
-    "@modelcontextprotocol/sdk": "^1.0.0",
+    "@modelcontextprotocol/sdk": "^1.30.0",
     "@usejunior/email-core": "^0.1.10",
     "@usejunior/provider-gmail": "^0.1.10",
     "@usejunior/provider-microsoft": "^0.1.10"
