@@ -89,7 +89,7 @@ describe('MatonGmailApiClient', () => {
     const [url, init] = fetchMock.mock.calls[0]!;
     const parsed = new URL(String(url));
     expect(parsed.origin + parsed.pathname).toBe(
-      'https://gateway.maton.ai/google-mail/gmail/v1/users/me/messages',
+      'https://api.maton.ai/google-mail/gmail/v1/users/me/messages',
     );
     expect(parsed.searchParams.getAll('labelIds')).toEqual(['INBOX', 'STARRED']);
     expect(parsed.searchParams.get('q')).toBe('from:a+b@example.com');

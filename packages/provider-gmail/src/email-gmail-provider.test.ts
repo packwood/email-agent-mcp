@@ -64,8 +64,8 @@ describe('provider-gmail/Message Mapping', () => {
 
     const message = await provider.getDraftMessage('r7990141845669078914');
 
-    expect(client.getMessage).toHaveBeenCalledWith('r7990141845669078914');
-    expect(message.id).toBe('msg-1');
+    expect(client.getDraft).toHaveBeenCalledWith('r7990141845669078914');
+    expect(message.id).toBe('msg-draft');
   });
 
   it('Scenario: Gmail message to EmailMessage', async () => {

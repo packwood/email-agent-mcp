@@ -2,7 +2,7 @@ import { readFile } from 'node:fs/promises';
 import { GraphApiError, type GraphApiClient } from './email-graph-provider.js';
 
 const GRAPH_ROOT = 'https://graph.microsoft.com/v1.0';
-const MATON_ROOT = 'https://gateway.maton.ai/outlook/v1.0';
+const MATON_ROOT = 'https://api.maton.ai/outlook/v1.0';
 const DEFAULT_DEADLINE_MS = 90_000;
 
 interface MatonConnectionRecord {
@@ -108,7 +108,7 @@ export function matonGraphUrl(url: string): string {
     return `${MATON_ROOT}${parsed.pathname.slice('/v1.0'.length)}${parsed.search}`;
   }
   if (
-    parsed.hostname === 'gateway.maton.ai' &&
+    parsed.hostname === 'api.maton.ai' &&
     (parsed.pathname === '/outlook/v1.0' || parsed.pathname.startsWith('/outlook/v1.0/'))
   ) {
     return parsed.toString();

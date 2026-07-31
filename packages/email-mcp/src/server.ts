@@ -1247,7 +1247,7 @@ export async function buildLazyActions(
                 id: message.id,
                 subject: message.subject,
                 from: formatAddress(message.from),
-                to: message.to.map(formatAddress),
+                to: (message.to ?? []).map(formatAddress),
                 cc: (message.cc ?? []).map(formatAddress),
                 bcc: (message.bcc ?? []).map(formatAddress),
                 receivedAt: message.receivedAt,

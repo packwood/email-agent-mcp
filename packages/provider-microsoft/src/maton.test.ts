@@ -73,22 +73,22 @@ describe('Maton Outlook connection isolation', () => {
 describe('Maton Graph URL boundary', () => {
   it('rewrites relative and Microsoft Graph v1 URLs without changing path or query', () => {
     expect(matonGraphUrl('/me/messages?$top=1')).toBe(
-      'https://gateway.maton.ai/outlook/v1.0/me/messages?$top=1',
+      'https://api.maton.ai/outlook/v1.0/me/messages?$top=1',
     );
     expect(matonGraphUrl('https://graph.microsoft.com/v1.0/me/messages?$skiptoken=abc')).toBe(
-      'https://gateway.maton.ai/outlook/v1.0/me/messages?$skiptoken=abc',
+      'https://api.maton.ai/outlook/v1.0/me/messages?$skiptoken=abc',
     );
-    expect(matonGraphUrl('https://gateway.maton.ai/outlook/v1.0/me/messages')).toBe(
-      'https://gateway.maton.ai/outlook/v1.0/me/messages',
+    expect(matonGraphUrl('https://api.maton.ai/outlook/v1.0/me/messages')).toBe(
+      'https://api.maton.ai/outlook/v1.0/me/messages',
     );
   });
 
   it.each([
     'http://graph.microsoft.com/v1.0/me/messages',
     'https://graph.microsoft.com.evil.example/v1.0/me/messages',
-    'https://gateway.maton.ai.evil.example/outlook/v1.0/me/messages',
-    'https://gateway.maton.ai/other/v1.0/me/messages',
-    'https://user:pass@gateway.maton.ai/outlook/v1.0/me/messages',
+    'https://api.maton.ai.evil.example/outlook/v1.0/me/messages',
+    'https://api.maton.ai/other/v1.0/me/messages',
+    'https://user:pass@api.maton.ai/outlook/v1.0/me/messages',
   ])('rejects an untrusted URL: %s', url => {
     expect(() => matonGraphUrl(url)).toThrow('Untrusted Microsoft Graph URL');
   });
@@ -106,7 +106,7 @@ describe('MatonGraphApiClient', () => {
     await expect(client.get('/me/messages')).resolves.toEqual({ value: [{ id: '1' }] });
     expect(fetchMock).toHaveBeenCalledTimes(1);
     const [url, init] = fetchMock.mock.calls[0]!;
-    expect(url).toBe('https://gateway.maton.ai/outlook/v1.0/me/messages');
+    expect(url).toBe('https://api.maton.ai/outlook/v1.0/me/messages');
     expect(init.headers).toMatchObject({
       Authorization: 'Bearer secret-key',
       'Maton-Connection': 'connection-1',

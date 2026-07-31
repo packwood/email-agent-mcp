@@ -1,7 +1,7 @@
 import { readFile } from 'node:fs/promises';
 import type { GmailApiClient, GmailMessage } from './email-gmail-provider.js';
 
-const MATON_GMAIL_ROOT = 'https://gateway.maton.ai/google-mail/gmail/v1';
+const MATON_GMAIL_ROOT = 'https://api.maton.ai/google-mail/gmail/v1';
 const DEFAULT_DEADLINE_MS = 90_000;
 
 interface MatonConnectionRecord {
@@ -181,7 +181,7 @@ export class MatonGmailApiClient implements GmailApiClient {
     const url = new URL(`${MATON_GMAIL_ROOT}${path}`);
     if (
       url.protocol !== 'https:' ||
-      url.hostname !== 'gateway.maton.ai' ||
+      url.hostname !== 'api.maton.ai' ||
       url.port !== '' ||
       url.username !== '' ||
       url.password !== '' ||
