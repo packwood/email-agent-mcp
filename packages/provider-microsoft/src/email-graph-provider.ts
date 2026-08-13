@@ -466,6 +466,10 @@ export class GraphEmailProvider implements EmailReader, EmailSender, EmailSchedu
     if (conversationId) {
       const params = new URLSearchParams();
       params.set('$filter', `conversationId eq '${conversationId}'`);
+      // The default Graph collection projection is metadata-only.  A thread
+      // returned without this explicit projection looks complete but loses
+      // every message body, which is unacceptable for an evidence workflow.
+      params.set('$select', MESSAGE_SELECT);
       // No `$orderby`: Graph rejects (`InefficientFilter`) an `$orderby` on a
       // property that isn't also the `$filter` property, and we fetch every
       // page and sort locally anyway — so ordering server-side buys nothing.

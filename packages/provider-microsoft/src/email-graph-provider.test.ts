@@ -1721,6 +1721,7 @@ describe('provider-microsoft/Thread Lookup', () => {
     const url = (client.get as ReturnType<typeof vi.fn>).mock.calls[1]![0] as string;
     const decodedUrl = decodeURIComponent(url).replaceAll('+', ' ');
     expect(decodedUrl).toContain("conversationId eq 'conv-123'");
+    expect(decodedUrl).toContain(`$select=${MESSAGE_SELECT}`);
     // No $orderby: Graph rejects an $orderby whose property isn't the $filter
     // property (InefficientFilter); messages are sorted locally instead.
     expect(decodedUrl).not.toContain('$orderby');
