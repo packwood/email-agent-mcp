@@ -1,5 +1,6 @@
 import { readFile } from 'node:fs/promises';
 import { GraphApiError, type GraphApiClient } from './email-graph-provider.js';
+import { MAX_READ_ATTEMPTS, readRetryDelayMs, safeErrorText } from './throttle.js';
 
 const GRAPH_ROOT = 'https://graph.microsoft.com/v1.0';
 const MATON_ROOT = 'https://api.maton.ai/outlook/v1.0';
@@ -134,18 +135,28 @@ export class MatonGraphApiClient implements GraphApiClient {
       Authorization: `Bearer ${this.apiKey}`,
       'Maton-Connection': this.connectionId,
     };
-    const init: RequestInit = {
-      method,
-      headers,
-      signal: AbortSignal.timeout(this.deadlineMs),
-    };
-    if (body !== undefined) {
-      headers['Content-Type'] = 'application/json';
-      init.body = JSON.stringify(body);
+    const serialized = body === undefined ? undefined : JSON.stringify(body);
+    if (serialized !== undefined) headers['Content-Type'] = 'application/json';
+    const target = matonGraphUrl(url);
+    const attempts = method === 'GET' ? MAX_READ_ATTEMPTS : 1;
+    let response!: Response;
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      // Build init per attempt: an AbortSignal.timeout is armed when created, so
+      // reusing one would abort every retry the moment the first deadline elapsed.
+      response = await fetch(target, {
+        method,
+        headers,
+        signal: AbortSignal.timeout(this.deadlineMs),
+        ...(serialized === undefined ? {} : { body: serialized }),
+      });
+      if (response.status !== 429 || attempt === attempts - 1) break;
+      // Discard the throttled body before sleeping so the connection can be reused.
+      await response.body?.cancel().catch(() => {});
+      const delayMs = readRetryDelayMs(response, attempt);
+      if (delayMs > 0) await new Promise(resolve => setTimeout(resolve, delayMs));
     }
-    const response = await fetch(matonGraphUrl(url), init);
     if (!response.ok) {
-      throw new GraphApiError(response.status, await response.text());
+      throw new GraphApiError(response.status, await safeErrorText(response));
     }
     return response;
   }

@@ -28,6 +28,7 @@ import type {
   SearchProviderOptions,
 } from '@usejunior/email-core';
 import { AttachmentNotSupportedError, AttachmentNotFoundError, ProviderError } from '@usejunior/email-core';
+import { MAX_READ_ATTEMPTS, readRetryDelayMs } from './throttle.js';
 
 const BODY_SIZE_LIMIT = 3.5 * 1024 * 1024; // 3.5MB
 const SUBJECT_MAX_LENGTH = 255;
@@ -286,16 +287,31 @@ export class RealGraphApiClient implements GraphApiClient {
     this.onAuthError = onAuthError;
   }
 
-  /** Fetch with automatic retry on 401 if onAuthError callback is provided. */
+  /**
+   * Fetch with automatic retry on 401 if onAuthError callback is provided, and on
+   * HTTP 429 throttling for reads. Writes are never retried: a throttled write may
+   * or may not have been applied, and re-sending mail is worse than surfacing the
+   * error. Mirrors the read-only retry policy of the Maton transports.
+   */
   private async fetchWithAuthRetry(url: string, init: RequestInit): Promise<Response> {
-    const resp = await fetch(url, init);
-    if (resp.status === 401 && this.onAuthError) {
-      const ok = await this.onAuthError();
-      if (ok) {
-        const newToken = await this.getToken();
-        const retryHeaders = { ...(init.headers as Record<string, string>), Authorization: `Bearer ${newToken}` };
-        return fetch(url, { ...init, headers: retryHeaders });
+    const method = (init.method ?? 'GET').toUpperCase();
+    const attempts = method === 'GET' ? MAX_READ_ATTEMPTS : 1;
+    let resp!: Response;
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      resp = await fetch(url, init);
+      if (resp.status === 401 && this.onAuthError) {
+        const ok = await this.onAuthError();
+        if (ok) {
+          const newToken = await this.getToken();
+          const retryHeaders = { ...(init.headers as Record<string, string>), Authorization: `Bearer ${newToken}` };
+          resp = await fetch(url, { ...init, headers: retryHeaders });
+        }
       }
+      if (resp.status !== 429 || attempt === attempts - 1) break;
+      // Discard the throttled body before sleeping so the connection can be reused.
+      await resp.body?.cancel().catch(() => {});
+      const delayMs = readRetryDelayMs(resp, attempt);
+      if (delayMs > 0) await new Promise(resolve => setTimeout(resolve, delayMs));
     }
     return resp;
   }
