@@ -1310,7 +1310,7 @@ describe('provider-microsoft/Graph Scheduled Send Inspection and Cancellation', 
     );
   });
 
-  it('Scenario: Cancellation verifies before delete', async () => {
+  it('Scenario: Cancellation verifies before moving to Deleted Items', async () => {
     const get = vi.fn().mockResolvedValue({
       id: 'AAMk/scheduled+=',
       isDraft: true,
@@ -1327,9 +1327,11 @@ describe('provider-microsoft/Graph Scheduled Send Inspection and Cancellation', 
     expect(get).toHaveBeenCalledWith(
       expect.stringContaining('/me/messages/AAMk%2Fscheduled%2B%3D?'),
     );
-    expect(client.delete).toHaveBeenCalledWith(
-      '/me/messages/AAMk%2Fscheduled%2B%3D',
+    expect(client.post).toHaveBeenCalledWith(
+      '/me/messages/AAMk%2Fscheduled%2B%3D/move',
+      { destinationId: 'deleteditems' },
     );
+    expect(client.delete).not.toHaveBeenCalled();
 
     const unsafeClient = createMockClient({
       get: vi.fn().mockResolvedValue({
@@ -1341,6 +1343,7 @@ describe('provider-microsoft/Graph Scheduled Send Inspection and Cancellation', 
     const unsafeProvider = new GraphEmailProvider(unsafeClient);
     await expect(unsafeProvider.cancelScheduledSend('ordinary'))
       .rejects.toMatchObject({ code: 'NOT_SCHEDULED' });
+    expect(unsafeClient.post).not.toHaveBeenCalled();
     expect(unsafeClient.delete).not.toHaveBeenCalled();
   });
 
@@ -1391,7 +1394,7 @@ describe('provider-microsoft/Graph Scheduled Send Inspection and Cancellation', 
       .rejects.toMatchObject({ code: 'NOT_SCHEDULED' });
     expect(missingBeforeGet.delete).not.toHaveBeenCalled();
 
-    const missingDuringDelete = createMockClient({
+    const missingDuringMove = createMockClient({
       get: vi.fn().mockResolvedValue({
         id: 'race',
         isDraft: true,
@@ -1400,10 +1403,52 @@ describe('provider-microsoft/Graph Scheduled Send Inspection and Cancellation', 
           value: '2026-07-24T12:00:00Z',
         }],
       }),
-      delete: vi.fn().mockRejectedValue(new GraphApiError(404, 'ErrorItemNotFound')),
+      post: vi.fn().mockRejectedValue(new GraphApiError(404, 'ErrorItemNotFound')),
     });
-    await expect(new GraphEmailProvider(missingDuringDelete).cancelScheduledSend('race'))
+    await expect(new GraphEmailProvider(missingDuringMove).cancelScheduledSend('race'))
       .rejects.toMatchObject({ code: 'NOT_SCHEDULED' });
+    expect(missingDuringMove.delete).not.toHaveBeenCalled();
+  });
+
+  it('falls back to DELETE when Graph rejects moving a deferred item', async () => {
+    const client = createMockClient({
+      get: vi.fn().mockResolvedValue({
+        id: 'deferred-1',
+        isDraft: true,
+        singleValueExtendedProperties: [{
+          id: 'SystemTime 0x3FEF',
+          value: '2026-07-24T12:00:00Z',
+        }],
+      }),
+      post: vi.fn().mockRejectedValue(new GraphApiError(403, 'ErrorAccessDenied')),
+    });
+    const provider = new GraphEmailProvider(client);
+
+    await provider.cancelScheduledSend('deferred-1');
+
+    expect(client.post).toHaveBeenCalledWith(
+      '/me/messages/deferred-1/move',
+      { destinationId: 'deleteditems' },
+    );
+    expect(client.delete).toHaveBeenCalledWith('/me/messages/deferred-1');
+  });
+
+  it('does not fall back to DELETE on a throttled move', async () => {
+    const client = createMockClient({
+      get: vi.fn().mockResolvedValue({
+        id: 'deferred-429',
+        isDraft: true,
+        singleValueExtendedProperties: [{
+          id: 'SystemTime 0x3FEF',
+          value: '2026-07-24T12:00:00Z',
+        }],
+      }),
+      post: vi.fn().mockRejectedValue(new GraphApiError(429, 'Too many requests')),
+    });
+
+    await expect(new GraphEmailProvider(client).cancelScheduledSend('deferred-429'))
+      .rejects.toMatchObject({ status: 429 });
+    expect(client.delete).not.toHaveBeenCalled();
   });
 });
 

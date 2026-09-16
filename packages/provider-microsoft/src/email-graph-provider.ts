@@ -1036,11 +1036,27 @@ export class GraphEmailProvider implements EmailReader, EmailSender, EmailSchedu
     if (candidate.isDraft !== true || !findDeferredSendProperty(candidate)) {
       throw scheduledSendNotFoundError();
     }
+    // Prefer a recoverable move to Deleted Items. Graph DELETE of a deferred
+    // draft has been observed to destroy the item (absent from Deleted Items,
+    // Drafts, Outbox, and Sent Items). If Graph rejects the move for a
+    // deferred item (400/403), fall back to today's DELETE so cancel still
+    // works. Do not invent a reschedule path.
     try {
-      await this.client.delete(`${this.basePath}/messages/${encodedId}`);
+      await this.moveToFolder(messageId, 'deleteditems');
     } catch (err) {
       if (err instanceof GraphApiError && err.status === 404) {
         throw scheduledSendNotFoundError();
+      }
+      if (err instanceof GraphApiError && (err.status === 400 || err.status === 403)) {
+        try {
+          await this.client.delete(`${this.basePath}/messages/${encodedId}`);
+        } catch (deleteErr) {
+          if (deleteErr instanceof GraphApiError && deleteErr.status === 404) {
+            throw scheduledSendNotFoundError();
+          }
+          throw deleteErr;
+        }
+        return;
       }
       throw err;
     }
