@@ -72,6 +72,8 @@ export {
   inspectDraftExactAction,
   sendDraftAction,
   updateDraftAction,
+  addDraftAttachmentsAction,
+  removeDraftAttachmentsAction,
 } from './actions/draft.js';
 export {
   cancelScheduledSendAction,

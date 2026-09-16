@@ -2915,3 +2915,126 @@ describe('provider-microsoft/Outbound Attachments', () => {
     expect(attCalls).toHaveLength(1);
   });
 });
+
+describe('provider-microsoft/Draft Attachment Mutations', () => {
+  const PDF = Buffer.from('%PDF-1.4\nbytes', 'utf-8');
+  type MockFn = ReturnType<typeof vi.fn>;
+
+  it('addDraftAttachments POSTs onto the collection without deleting existing files or sending', async () => {
+    const client = createMockClient({
+      get: vi.fn().mockResolvedValue({ id: 'draft-1', isDraft: true }),
+    });
+    const provider = new GraphEmailProvider(client);
+
+    const result = await provider.addDraftAttachments('draft-1', [
+      { filename: 'extra.pdf', content: PDF, mimeType: 'application/pdf' },
+    ]);
+
+    expect(result.success).toBe(true);
+    expect(result.draftId).toBe('draft-1');
+    expect(client.get).toHaveBeenCalledWith('/me/messages/draft-1?$select=id,isDraft');
+    const attCalls = (client.post as MockFn).mock.calls.filter(c => String(c[0]).endsWith('/attachments'));
+    expect(attCalls).toHaveLength(1);
+    expect(attCalls[0]![1]).toMatchObject({
+      '@odata.type': '#microsoft.graph.fileAttachment',
+      name: 'extra.pdf',
+      contentBytes: PDF.toString('base64'),
+    });
+    expect(client.delete).not.toHaveBeenCalled();
+    expect((client.post as MockFn).mock.calls.every(c => !String(c[0]).endsWith('/send'))).toBe(true);
+  });
+
+  it('addDraftAttachments rejects an oversize file before any Graph call', async () => {
+    const client = createMockClient();
+    const provider = new GraphEmailProvider(client);
+
+    const result = await provider.addDraftAttachments('draft-1', [{
+      filename: 'big.bin',
+      content: Buffer.alloc(3 * 1024 * 1024 + 1),
+      mimeType: 'application/octet-stream',
+    }]);
+
+    expect(result.success).toBe(false);
+    expect(result.error?.code).toBe('ATTACHMENT_TOO_LARGE_FOR_PROVIDER');
+    expect(client.get).not.toHaveBeenCalled();
+    expect(client.post).not.toHaveBeenCalled();
+  });
+
+  it('addDraftAttachments refuses a non-draft without posting', async () => {
+    const client = createMockClient({
+      get: vi.fn().mockResolvedValue({ id: 'sent-1', isDraft: false }),
+    });
+    const provider = new GraphEmailProvider(client);
+
+    const result = await provider.addDraftAttachments('sent-1', [
+      { filename: 'extra.pdf', content: PDF, mimeType: 'application/pdf' },
+    ]);
+
+    expect(result.success).toBe(false);
+    expect(result.error?.code).toBe('NOT_A_DRAFT');
+    expect(client.post).not.toHaveBeenCalled();
+  });
+
+  it('removeDraftAttachments DELETEs only the named ids', async () => {
+    const client = createMockClient({
+      get: vi.fn(async (url: string) => {
+        if (String(url).includes('/attachments')) {
+          return { value: [{ id: 'keep-att' }, { id: 'drop-att' }] };
+        }
+        return { id: 'draft-1', isDraft: true };
+      }),
+    });
+    const provider = new GraphEmailProvider(client);
+
+    const result = await provider.removeDraftAttachments('draft-1', ['drop-att']);
+
+    expect(result.success).toBe(true);
+    expect(client.delete).toHaveBeenCalledTimes(1);
+    expect(client.delete).toHaveBeenCalledWith('/me/messages/draft-1/attachments/drop-att');
+    expect(client.delete).not.toHaveBeenCalledWith(expect.stringContaining('keep-att'));
+    expect((client.post as MockFn).mock.calls.every(c => !String(c[0]).endsWith('/send'))).toBe(true);
+  });
+
+  it('removeDraftAttachments fails closed when an id is missing and deletes nothing', async () => {
+    const client = createMockClient({
+      get: vi.fn(async (url: string) => {
+        if (String(url).includes('/attachments')) {
+          return { value: [{ id: 'keep-att' }] };
+        }
+        return { id: 'draft-1', isDraft: true };
+      }),
+    });
+    const provider = new GraphEmailProvider(client);
+
+    const result = await provider.removeDraftAttachments('draft-1', ['keep-att', 'missing-att']);
+
+    expect(result.success).toBe(false);
+    expect(result.error?.code).toBe('ATTACHMENT_NOT_FOUND');
+    expect(client.delete).not.toHaveBeenCalled();
+  });
+
+  it('encodes draft and attachment ids on add and remove', async () => {
+    const client = createMockClient({
+      get: vi.fn(async (url: string) => {
+        if (String(url).includes('/attachments')) {
+          return { value: [{ id: 'AAA/BBB+CCC=' }] };
+        }
+        return { id: 'AAMk/draft+=', isDraft: true };
+      }),
+    });
+    const provider = new GraphEmailProvider(client);
+
+    await provider.addDraftAttachments('AAMk/draft+=', [
+      { filename: 'note.pdf', content: PDF, mimeType: 'application/pdf' },
+    ]);
+    await provider.removeDraftAttachments('AAMk/draft+=', ['AAA/BBB+CCC=']);
+
+    expect(client.post).toHaveBeenCalledWith(
+      '/me/messages/AAMk%2Fdraft%2B%3D/attachments',
+      expect.any(Object),
+    );
+    expect(client.delete).toHaveBeenCalledWith(
+      '/me/messages/AAMk%2Fdraft%2B%3D/attachments/AAA%2FBBB%2BCCC%3D',
+    );
+  });
+});

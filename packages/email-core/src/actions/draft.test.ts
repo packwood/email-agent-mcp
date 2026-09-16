@@ -5,9 +5,11 @@ import { tmpdir } from 'node:os';
 import { createHash } from 'node:crypto';
 import { MockEmailProvider } from '../testing/mock-provider.js';
 import {
+  addDraftAttachmentsAction,
   createDraftAction,
   findDraftByTrackingIdAction,
   inspectDraftExactAction,
+  removeDraftAttachmentsAction,
   sendDraftAction,
   updateDraftAction,
 } from './draft.js';
@@ -1721,5 +1723,126 @@ describe('email-write/Caller Tracking Id', () => {
       success: false,
       error: { code: 'NOT_SUPPORTED', recoverable: false },
     });
+  });
+});
+
+describe('email-write/Draft Attachment Mutations', () => {
+  const pdf = Buffer.from('%PDF-1.4\n1 0 obj<<>>endobj\n', 'utf-8');
+
+  async function createDraftWithAttachment(): Promise<string> {
+    await writeFile(join(testDir, 'existing.pdf'), pdf);
+    const created = await createDraftAction.run(ctx, {
+      to: 'alice@allowed.com',
+      subject: 'With file',
+      body: 'Hello',
+      attachments: [{ path: 'existing.pdf' }],
+    });
+    expect(created.success).toBe(true);
+    return created.draftId!;
+  }
+
+  it('add_draft_attachments appends files without dropping existing ones or sending', async () => {
+    const draftId = await createDraftWithAttachment();
+    await writeFile(join(testDir, 'extra.pdf'), pdf);
+    const sendSpy = vi.spyOn(provider, 'sendMessage');
+    const sendDraftSpy = vi.spyOn(provider, 'sendDraft');
+
+    const result = await addDraftAttachmentsAction.run(ctx, {
+      draft_id: draftId,
+      attachments: [{ path: 'extra.pdf' }],
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.draftId).toBe(draftId);
+    expect(result.attachments).toHaveLength(2);
+    expect(result.attachments?.map(a => a.filename)).toEqual(['existing.pdf', 'extra.pdf']);
+    expect(provider.getDrafts().get(draftId)!.attachments).toHaveLength(2);
+    expect(sendSpy).not.toHaveBeenCalled();
+    expect(sendDraftSpy).not.toHaveBeenCalled();
+    expect(provider.getSentMessages()).toHaveLength(0);
+  });
+
+  it('remove_draft_attachments deletes only the named id', async () => {
+    const draftId = await createDraftWithAttachment();
+    await writeFile(join(testDir, 'extra.pdf'), pdf);
+    await addDraftAttachmentsAction.run(ctx, {
+      draft_id: draftId,
+      attachments: [{ path: 'extra.pdf' }],
+    });
+    const before = (await provider.getMessage(draftId)).attachments ?? [];
+    expect(before).toHaveLength(2);
+    const dropId = before.find(attachment => attachment.filename === 'existing.pdf')!.id;
+
+    const result = await removeDraftAttachmentsAction.run(ctx, {
+      draft_id: draftId,
+      attachment_ids: [dropId],
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.attachments).toHaveLength(1);
+    expect(result.attachments![0]!.filename).toBe('extra.pdf');
+    expect(provider.getSentMessages()).toHaveLength(0);
+  });
+
+  it('remove_draft_attachments fails closed when an id is missing and does not drop unnamed files', async () => {
+    const draftId = await createDraftWithAttachment();
+    const before = (await provider.getMessage(draftId)).attachments ?? [];
+
+    const result = await removeDraftAttachmentsAction.run(ctx, {
+      draft_id: draftId,
+      attachment_ids: [before[0]!.id, 'missing-att'],
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.error?.code).toBe('ATTACHMENT_NOT_FOUND');
+    expect(provider.getDrafts().get(draftId)!.attachments).toHaveLength(1);
+  });
+
+  it('returns NOT_SUPPORTED when the provider has no attachment-level API and names the wholesale-replace alternative', async () => {
+    const draftId = await createDraftWithAttachment();
+    Object.defineProperty(provider, 'addDraftAttachments', { value: undefined });
+    Object.defineProperty(provider, 'removeDraftAttachments', { value: undefined });
+
+    const added = await addDraftAttachmentsAction.run(ctx, {
+      draft_id: draftId,
+      attachments: [{ path: 'existing.pdf' }],
+    });
+    const removed = await removeDraftAttachmentsAction.run(ctx, {
+      draft_id: draftId,
+      attachment_ids: ['att-1'],
+    });
+
+    expect(added).toMatchObject({
+      success: false,
+      error: { code: 'NOT_SUPPORTED', recoverable: false },
+    });
+    expect(added.error?.message).toContain('update_draft');
+    expect(added.error?.message).toContain('attachments');
+    expect(removed).toMatchObject({
+      success: false,
+      error: { code: 'NOT_SUPPORTED', recoverable: false },
+    });
+    expect(removed.error?.message).toContain('update_draft');
+    expect(provider.getDrafts().get(draftId)!.attachments).toHaveLength(1);
+  });
+
+  it('requires mailbox when multiple accounts are configured', async () => {
+    const multi: ActionContext = {
+      ...ctx,
+      allMailboxes: [
+        { name: 'work', emailAddress: 'me@company.com', provider, providerType: 'microsoft', isDefault: true, status: 'connected' },
+        { name: 'personal', emailAddress: 'me@home.com', provider, providerType: 'microsoft', isDefault: false, status: 'connected' },
+      ],
+    };
+    const added = await addDraftAttachmentsAction.run(multi, {
+      draft_id: 'draft-1',
+      attachments: [{ base64: pdf.toString('base64'), filename: 'note.pdf' }],
+    });
+    const removed = await removeDraftAttachmentsAction.run(multi, {
+      draft_id: 'draft-1',
+      attachment_ids: ['att-1'],
+    });
+    expect(added.error?.code).toBe('MAILBOX_REQUIRED');
+    expect(removed.error?.code).toBe('MAILBOX_REQUIRED');
   });
 });

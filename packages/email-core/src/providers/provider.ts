@@ -3,6 +3,7 @@ import type {
   EmailMessage,
   EmailThread,
   ComposeMessage,
+  OutboundAttachment,
   SendResult,
   DraftResult,
   ListOptions,
@@ -55,6 +56,18 @@ export interface EmailSender {
   createForwardDraft?(messageId: string, opts: ForwardOptions): Promise<DraftResult>;
   getDraftReplyStatus?(draftId: string): Promise<DraftReplyStatus>;
   updateDraft?(draftId: string, msg: Partial<ComposeMessage>): Promise<DraftResult>;
+  /**
+   * POST new files onto an existing draft without replacing or sending.
+   * Providers without an attachment-level API must omit this method so the
+   * action layer can fail closed with NOT_SUPPORTED (Gmail: use update_draft
+   * with an explicit attachments array instead).
+   */
+  addDraftAttachments?(draftId: string, attachments: OutboundAttachment[]): Promise<DraftResult>;
+  /**
+   * DELETE only the named attachment ids from an existing draft. Must not
+   * remove an attachment the caller did not name, re-upload others, or send.
+   */
+  removeDraftAttachments?(draftId: string, attachmentIds: string[]): Promise<DraftResult>;
 }
 
 export type DraftReplyStatus = 'reply' | 'non_reply' | 'indeterminate';

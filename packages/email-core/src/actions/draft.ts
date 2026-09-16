@@ -1,7 +1,7 @@
 // Draft actions — create_draft, send_draft, update_draft
 import { z } from 'zod';
 import { createHash } from 'node:crypto';
-import type { EmailAction } from './registry.js';
+import type { ActionContext, EmailAction } from './registry.js';
 import { checkSendAllowlist } from '../security/send-allowlist.js';
 import { checkReplyThreading } from '../security/reply-validation.js';
 import { withRetry } from '../providers/provider.js';
@@ -679,6 +679,157 @@ export const updateDraftAction: EmailAction<
       };
     } catch (err) {
       return handleProviderError(err, 'UPDATE_DRAFT_FAILED');
+    }
+  },
+};
+
+// --- add_draft_attachments / remove_draft_attachments ---
+
+const ATTACHMENT_LEVEL_NOT_SUPPORTED =
+  'Attachment-level add and remove is not supported by this email provider. Use update_draft with an explicit attachments array to replace the set wholesale.';
+
+const DraftAttachmentMutationErrorSchema = z.object({
+  code: z.string(),
+  message: z.string(),
+  recoverable: z.boolean(),
+  availableMailboxes: z.array(z.string()).optional(),
+  defaultMailbox: z.string().optional(),
+});
+
+const RemainingAttachmentSchema = z.object({
+  id: z.string(),
+  filename: z.string(),
+  mimeType: z.string(),
+  size: z.number(),
+  isInline: z.boolean(),
+});
+
+const DraftAttachmentMutationOutput = z.object({
+  success: z.boolean(),
+  draftId: z.string().optional(),
+  attachments: z.array(RemainingAttachmentSchema).optional(),
+  error: DraftAttachmentMutationErrorSchema.optional(),
+});
+
+async function remainingDraftAttachments(
+  provider: ActionContext['provider'],
+  draftId: string,
+): Promise<z.infer<typeof RemainingAttachmentSchema>[] | undefined> {
+  try {
+    const message = await (provider.getDraft?.(draftId) ?? provider.getMessage(draftId));
+    return (message.attachments ?? []).map(attachment => ({
+      id: attachment.id,
+      filename: attachment.filename,
+      mimeType: attachment.mimeType,
+      size: attachment.size,
+      isInline: attachment.isInline,
+    }));
+  } catch {
+    return undefined;
+  }
+}
+
+const AddDraftAttachmentsInput = z.object({
+  mailbox: z.string().optional(),
+  draft_id: z.string(),
+  attachments: z.array(AttachmentInputSchema).min(1)
+    .describe('Files to add to the draft. Existing attachments are left untouched. Each entry takes a sandboxed `path` or inline `base64`.'),
+});
+
+export const addDraftAttachmentsAction: EmailAction<
+  z.infer<typeof AddDraftAttachmentsInput>,
+  z.infer<typeof DraftAttachmentMutationOutput>
+> = {
+  name: 'add_draft_attachments',
+  description: 'Add files to an existing draft without replacing others or sending. Providers without an attachment-level API (Gmail) return NOT_SUPPORTED; use update_draft with an explicit attachments array instead.',
+  input: AddDraftAttachmentsInput,
+  output: DraftAttachmentMutationOutput,
+  annotations: { readOnlyHint: false, destructiveHint: false },
+  run: async (ctx, input) => {
+    const mailboxError = checkMailboxRequired(input.mailbox, ctx.allMailboxes);
+    if (mailboxError) {
+      return { success: false, error: mailboxError };
+    }
+
+    if (!ctx.provider.addDraftAttachments) {
+      return {
+        success: false,
+        error: { code: 'NOT_SUPPORTED', message: ATTACHMENT_LEVEL_NOT_SUPPORTED, recoverable: false },
+      };
+    }
+
+    const attResult = await resolveAttachments(input.attachments, ctx.safeDir);
+    if (attResult.error) {
+      return { success: false, error: attResult.error };
+    }
+
+    try {
+      const result = await ctx.provider.addDraftAttachments(input.draft_id, attResult.files!);
+      const attachments = result.success && result.draftId
+        ? await remainingDraftAttachments(ctx.provider, result.draftId)
+        : undefined;
+      return {
+        success: result.success,
+        draftId: result.draftId,
+        ...(attachments !== undefined ? { attachments } : {}),
+        error: result.error ? {
+          code: result.error.code,
+          message: result.error.message,
+          recoverable: result.error.recoverable,
+        } : undefined,
+      };
+    } catch (err) {
+      return handleProviderError(err, 'ATTACHMENT_UPDATE_FAILED');
+    }
+  },
+};
+
+const RemoveDraftAttachmentsInput = z.object({
+  mailbox: z.string().optional(),
+  draft_id: z.string(),
+  attachment_ids: z.array(z.string().min(1)).min(1)
+    .describe('Attachment ids to remove. Only these ids are deleted; unnamed attachments are left untouched.'),
+});
+
+export const removeDraftAttachmentsAction: EmailAction<
+  z.infer<typeof RemoveDraftAttachmentsInput>,
+  z.infer<typeof DraftAttachmentMutationOutput>
+> = {
+  name: 'remove_draft_attachments',
+  description: 'Remove named attachments from an existing draft without sending. Unnamed attachments are preserved. Providers without an attachment-level API (Gmail) return NOT_SUPPORTED; use update_draft with an explicit attachments array instead.',
+  input: RemoveDraftAttachmentsInput,
+  output: DraftAttachmentMutationOutput,
+  annotations: { readOnlyHint: false, destructiveHint: true },
+  run: async (ctx, input) => {
+    const mailboxError = checkMailboxRequired(input.mailbox, ctx.allMailboxes);
+    if (mailboxError) {
+      return { success: false, error: mailboxError };
+    }
+
+    if (!ctx.provider.removeDraftAttachments) {
+      return {
+        success: false,
+        error: { code: 'NOT_SUPPORTED', message: ATTACHMENT_LEVEL_NOT_SUPPORTED, recoverable: false },
+      };
+    }
+
+    try {
+      const result = await ctx.provider.removeDraftAttachments(input.draft_id, input.attachment_ids);
+      const attachments = result.success && result.draftId
+        ? await remainingDraftAttachments(ctx.provider, result.draftId)
+        : undefined;
+      return {
+        success: result.success,
+        draftId: result.draftId,
+        ...(attachments !== undefined ? { attachments } : {}),
+        error: result.error ? {
+          code: result.error.code,
+          message: result.error.message,
+          recoverable: result.error.recoverable,
+        } : undefined,
+      };
+    } catch (err) {
+      return handleProviderError(err, 'ATTACHMENT_UPDATE_FAILED');
     }
   },
 };

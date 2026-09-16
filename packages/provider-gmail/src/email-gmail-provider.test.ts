@@ -2,10 +2,12 @@ import { describe, it, expect, vi } from 'vitest';
 import { GmailEmailProvider, type GmailApiClient } from './email-gmail-provider.js';
 import {
   AttachmentNotFoundError,
+  addDraftAttachmentsAction,
   cancelScheduledSendAction,
   deleteEmailAction,
   listScheduledSendsAction,
   moveToFolderAction,
+  removeDraftAttachmentsAction,
   sendDraftAction,
   sendEmailAction,
   type EmailScheduledSender,
@@ -768,6 +770,44 @@ describe('email-write/Unsupported Scheduled Send Providers', () => {
       expect(client.getMessage).not.toHaveBeenCalled();
       expect(client.sendDraft).not.toHaveBeenCalled();
     });
+  });
+});
+
+describe('provider-gmail/Attachment-Level Draft Mutations Are Explicitly Unsupported', () => {
+  it('Scenario: Gmail has no attachment-level API and names the wholesale-replace alternative', async () => {
+    const client = createMockGmailClient();
+    const provider = new GmailEmailProvider(client);
+    const mutating = provider as unknown as {
+      addDraftAttachments?: unknown;
+      removeDraftAttachments?: unknown;
+    };
+
+    const added = await addDraftAttachmentsAction.run({ provider }, {
+      draft_id: 'draft-abc',
+      attachments: [{ base64: Buffer.from('%PDF-1.4').toString('base64'), filename: 'note.pdf' }],
+    });
+    const removed = await removeDraftAttachmentsAction.run({ provider }, {
+      draft_id: 'draft-abc',
+      attachment_ids: ['att-1'],
+    });
+
+    expect(mutating.addDraftAttachments).toBeUndefined();
+    expect(mutating.removeDraftAttachments).toBeUndefined();
+    expect(added).toMatchObject({
+      success: false,
+      error: { code: 'NOT_SUPPORTED', recoverable: false },
+    });
+    expect(added.error?.message).toContain('update_draft');
+    expect(added.error?.message).toContain('attachments');
+    expect(removed).toMatchObject({
+      success: false,
+      error: { code: 'NOT_SUPPORTED', recoverable: false },
+    });
+    expect(client.createDraft).not.toHaveBeenCalled();
+    expect(client.updateDraft).not.toHaveBeenCalled();
+    expect(client.sendDraft).not.toHaveBeenCalled();
+    expect(client.sendMessage).not.toHaveBeenCalled();
+    expect(client.getDraft).not.toHaveBeenCalled();
   });
 });
 

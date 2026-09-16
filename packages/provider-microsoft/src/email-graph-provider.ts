@@ -1323,6 +1323,102 @@ export class GraphEmailProvider implements EmailReader, EmailSender, EmailSchedu
     return { success: true, draftId };
   }
 
+  /**
+   * Confirm the id is a live draft before mutating its attachment collection.
+   * Sent mail must not grow or lose attachments through these paths.
+   */
+  private async requireDraft(draftId: string): Promise<EmailError | null> {
+    try {
+      const message = await this.client.get(
+        `${this.basePath}/messages/${encodeGraphPathId(draftId)}?$select=id,isDraft`,
+      ) as unknown as GraphMessage;
+      if (message.isDraft !== true) {
+        return {
+          code: 'NOT_A_DRAFT',
+          message: `Message ${draftId} is not a draft`,
+          recoverable: false,
+        };
+      }
+      return null;
+    } catch (err) {
+      if (err instanceof GraphApiError && err.status === 404) {
+        return {
+          code: 'DRAFT_NOT_FOUND',
+          message: `Draft not found: ${draftId}`,
+          recoverable: false,
+        };
+      }
+      throw err;
+    }
+  }
+
+  async addDraftAttachments(draftId: string, attachments: OutboundAttachment[]): Promise<DraftResult> {
+    const sizeError = checkGraphAttachmentLimits(attachments, { checkTotal: false });
+    if (sizeError) {
+      return { success: false, draftId, error: sizeError };
+    }
+    const draftError = await this.requireDraft(draftId);
+    if (draftError) {
+      return { success: false, draftId, error: draftError };
+    }
+    try {
+      await this.postDraftAttachments(draftId, attachments);
+      return { success: true, draftId };
+    } catch (err) {
+      return {
+        success: false,
+        draftId,
+        error: {
+          code: 'ATTACHMENT_UPLOAD_FAILED',
+          message: `Draft ${draftId} exists, but adding attachments failed: ${err instanceof Error ? err.message : String(err)}`,
+          recoverable: false,
+        },
+      };
+    }
+  }
+
+  async removeDraftAttachments(draftId: string, attachmentIds: string[]): Promise<DraftResult> {
+    const draftError = await this.requireDraft(draftId);
+    if (draftError) {
+      return { success: false, draftId, error: draftError };
+    }
+
+    const existing = await this.listAttachments(draftId);
+    const named = [...new Set(attachmentIds)];
+    const existingIds = new Set(existing.map(attachment => attachment.id));
+    const missing = named.filter(id => !existingIds.has(id));
+    if (missing.length > 0) {
+      return {
+        success: false,
+        draftId,
+        error: {
+          code: 'ATTACHMENT_NOT_FOUND',
+          message: `Attachment not found on draft ${draftId}: ${missing.join(', ')}`,
+          recoverable: false,
+        },
+      };
+    }
+
+    try {
+      for (const attachmentId of named) {
+        await this.client.delete(
+          `${this.basePath}/messages/${encodeGraphPathId(draftId)}/attachments/${encodeGraphPathId(attachmentId)}`,
+        );
+      }
+      return { success: true, draftId };
+    } catch (err) {
+      return {
+        success: false,
+        draftId,
+        error: {
+          code: 'ATTACHMENT_UPDATE_FAILED',
+          message: `Draft ${draftId} was verified, but removing attachments failed: ${err instanceof Error ? err.message : String(err)}`,
+          recoverable: false,
+        },
+      };
+    }
+  }
+
   async findDraftByTrackingId(trackingId: string): Promise<DraftLookupResult | null> {
     const escaped = trackingId.replace(/'/g, "''");
     const filter = `singleValueExtendedProperties/Any(ep: ep/id eq '${TRACKING_PROPERTY}' and ep/value eq '${escaped}')`;

@@ -3,6 +3,7 @@ import type {
   EmailMessage,
   EmailThread,
   ComposeMessage,
+  OutboundAttachment,
   SendResult,
   DraftResult,
   ListOptions,
@@ -415,6 +416,58 @@ export class MockEmailProvider implements EmailReader, EmailSender, EmailSchedul
       // Omitted attachments → preserve via the `...existing` spread;
       // provided (even []) → replace.
       ...(msg.attachments !== undefined && { attachments: msg.attachments }),
+    });
+    return { success: true, draftId };
+  }
+
+  async addDraftAttachments(draftId: string, attachments: OutboundAttachment[]): Promise<DraftResult> {
+    this.maybeThrow();
+    const existing = this.drafts.get(draftId);
+    if (!existing) {
+      return {
+        success: false,
+        error: { code: 'DRAFT_NOT_FOUND', message: `Draft not found: ${draftId}`, recoverable: false },
+      };
+    }
+    this.drafts.set(draftId, {
+      ...existing,
+      attachments: [...(existing.attachments ?? []), ...attachments],
+    });
+    return { success: true, draftId };
+  }
+
+  async removeDraftAttachments(draftId: string, attachmentIds: string[]): Promise<DraftResult> {
+    this.maybeThrow();
+    const existing = this.drafts.get(draftId);
+    if (!existing) {
+      return {
+        success: false,
+        error: { code: 'DRAFT_NOT_FOUND', message: `Draft not found: ${draftId}`, recoverable: false },
+      };
+    }
+    const current = (existing.attachments ?? []).map((attachment, index) => ({
+      ...attachment,
+      id: `${draftId}-att-${index}`,
+    }));
+    const named = [...new Set(attachmentIds)];
+    const missing = named.filter(id => !current.some(attachment => attachment.id === id));
+    if (missing.length > 0) {
+      return {
+        success: false,
+        draftId,
+        error: {
+          code: 'ATTACHMENT_NOT_FOUND',
+          message: `Attachment not found on draft ${draftId}: ${missing.join(', ')}`,
+          recoverable: false,
+        },
+      };
+    }
+    const namedSet = new Set(named);
+    this.drafts.set(draftId, {
+      ...existing,
+      attachments: current
+        .filter(attachment => !namedSet.has(attachment.id))
+        .map(({ filename, content, mimeType }) => ({ filename, content, mimeType })),
     });
     return { success: true, draftId };
   }
