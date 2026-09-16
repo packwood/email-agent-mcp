@@ -1433,6 +1433,57 @@ describe('provider-microsoft/Graph Scheduled Send Inspection and Cancellation', 
     expect(client.delete).toHaveBeenCalledWith('/me/messages/deferred-1');
   });
 
+  it('falls back to DELETE when Graph refuses the move with 500 ErrorMoveCopyFailed', async () => {
+    // Live canary 2026-09-15: a submitted deferred-send draft is locked by Graph, so
+    // POST /move answers 500 ErrorMoveCopyFailed (not 400/403). Without this branch the
+    // error rethrows and cancellation is impossible, which is worse than a destructive
+    // cancel: the message still delivers.
+    const client = createMockClient({
+      get: vi.fn().mockResolvedValue({
+        id: 'deferred-500',
+        isDraft: true,
+        singleValueExtendedProperties: [{
+          id: 'SystemTime 0x3FEF',
+          value: '2026-07-24T12:00:00Z',
+        }],
+      }),
+      post: vi.fn().mockRejectedValue(
+        new GraphApiError(500, '{"error":{"code":"ErrorMoveCopyFailed","message":"The move or copy operation failed."}}'),
+      ),
+    });
+    const provider = new GraphEmailProvider(client);
+
+    await provider.cancelScheduledSend('deferred-500');
+
+    expect(client.post).toHaveBeenCalledWith(
+      '/me/messages/deferred-500/move',
+      { destinationId: 'deleteditems' },
+    );
+    expect(client.delete).toHaveBeenCalledWith('/me/messages/deferred-500');
+  });
+
+  it('does not fall back to DELETE on an unrelated 500', async () => {
+    // Only the move-refusal signature may unlock the destructive path; a generic server
+    // error must surface so a transient Graph fault never silently destroys a draft.
+    const client = createMockClient({
+      get: vi.fn().mockResolvedValue({
+        id: 'deferred-500-other',
+        isDraft: true,
+        singleValueExtendedProperties: [{
+          id: 'SystemTime 0x3FEF',
+          value: '2026-07-24T12:00:00Z',
+        }],
+      }),
+      post: vi.fn().mockRejectedValue(
+        new GraphApiError(500, '{"error":{"code":"InternalServerError"}}'),
+      ),
+    });
+
+    await expect(new GraphEmailProvider(client).cancelScheduledSend('deferred-500-other'))
+      .rejects.toMatchObject({ status: 500 });
+    expect(client.delete).not.toHaveBeenCalled();
+  });
+
   it('does not fall back to DELETE on a throttled move', async () => {
     const client = createMockClient({
       get: vi.fn().mockResolvedValue({

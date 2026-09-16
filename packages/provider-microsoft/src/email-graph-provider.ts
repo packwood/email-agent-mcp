@@ -1036,18 +1036,21 @@ export class GraphEmailProvider implements EmailReader, EmailSender, EmailSchedu
     if (candidate.isDraft !== true || !findDeferredSendProperty(candidate)) {
       throw scheduledSendNotFoundError();
     }
-    // Prefer a recoverable move to Deleted Items. Graph DELETE of a deferred
-    // draft has been observed to destroy the item (absent from Deleted Items,
-    // Drafts, Outbox, and Sent Items). If Graph rejects the move for a
-    // deferred item (400/403), fall back to today's DELETE so cancel still
-    // works. Do not invent a reschedule path.
+    // Try a move to Deleted Items first, then DELETE. Live canaries show Graph
+    // locks a submitted deferred-send draft: the move is refused (400/403, or
+    // 500 ErrorMoveCopyFailed) and DELETE destroys the item (absent from
+    // Deleted Items, Drafts, Outbox and Sent Items). Cancel is therefore
+    // destructive in practice; the move stays only in case a tenant allows it.
+    // Any other 500 rethrows so a transient fault never destroys a draft.
+    // Do not invent a reschedule path: PATCHing the deferred time returns 403.
     try {
       await this.moveToFolder(messageId, 'deleteditems');
     } catch (err) {
       if (err instanceof GraphApiError && err.status === 404) {
         throw scheduledSendNotFoundError();
       }
-      if (err instanceof GraphApiError && (err.status === 400 || err.status === 403)) {
+      if (err instanceof GraphApiError && (err.status === 400 || err.status === 403
+        || (err.status === 500 && /ErrorMoveCopyFailed/.test(err.message ?? '')))) {
         try {
           await this.client.delete(`${this.basePath}/messages/${encodedId}`);
         } catch (deleteErr) {
