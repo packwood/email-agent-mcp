@@ -700,6 +700,44 @@ describe('email-write/Draft Address Parsing', () => {
     expect(draft.cc).toEqual([{ name: 'Bob', email: 'bob@allowed.com' }]);
   });
 
+  it('create_draft parses bcc with the same name-address grammar as to/cc', async () => {
+    const result = await createDraftAction.run(ctx, {
+      to: 'alice@allowed.com',
+      cc: ['Bob <bob@allowed.com>'],
+      bcc: ['"Carol Jones" <carol@hidden.com>'],
+      subject: 'Quiet copy',
+      body: 'Body',
+    });
+
+    expect(result.success).toBe(true);
+    const draft = provider.getDrafts().get(result.draftId!)!;
+    expect(draft.bcc).toEqual([{ name: 'Carol Jones', email: 'carol@hidden.com' }]);
+    expect(draft.cc).toEqual([{ name: 'Bob', email: 'bob@allowed.com' }]);
+  });
+
+  it('create_draft returns INVALID_ADDRESS for a malformed bcc', async () => {
+    const result = await createDraftAction.run(ctx, {
+      to: 'alice@allowed.com',
+      bcc: ['not an email'],
+      subject: 'Bad bcc',
+      body: 'Body',
+    });
+    expect(result.success).toBe(false);
+    expect(result.error!.code).toBe('INVALID_ADDRESS');
+    expect(result.error!.message).toContain('bcc[0]');
+  });
+
+  it('create_draft with bcc to a blocked address still succeeds (drafts bypass allowlist)', async () => {
+    const result = await createDraftAction.run(ctx, {
+      to: 'alice@allowed.com',
+      bcc: ['secret@blocked.com'],
+      subject: 'Hidden',
+      body: 'Body',
+    });
+    expect(result.success).toBe(true);
+    expect(provider.getDrafts().get(result.draftId!)!.bcc).toEqual([{ email: 'secret@blocked.com' }]);
+  });
+
   it('update_draft with cc: [] explicitly clears cc', async () => {
     const created = await createDraftAction.run(ctx, {
       to: 'alice@allowed.com',
@@ -717,6 +755,32 @@ describe('email-write/Draft Address Parsing', () => {
     expect(updated.success).toBe(true);
     const draft = provider.getDrafts().get(created.draftId!)!;
     expect(draft.cc).toEqual([]);
+  });
+
+  it('update_draft parses bcc and can clear it with an empty array', async () => {
+    const created = await createDraftAction.run(ctx, {
+      to: 'alice@allowed.com',
+      bcc: ['hidden@allowed.com'],
+      subject: 'Original',
+      body: 'Body',
+    });
+    expect(created.success).toBe(true);
+
+    const updated = await updateDraftAction.run(ctx, {
+      draft_id: created.draftId!,
+      bcc: ['Audit <audit@allowed.com>'],
+    });
+    expect(updated.success).toBe(true);
+    expect(provider.getDrafts().get(created.draftId!)!.bcc).toEqual([
+      { name: 'Audit', email: 'audit@allowed.com' },
+    ]);
+
+    const cleared = await updateDraftAction.run(ctx, {
+      draft_id: created.draftId!,
+      bcc: [],
+    });
+    expect(cleared.success).toBe(true);
+    expect(provider.getDrafts().get(created.draftId!)!.bcc).toEqual([]);
   });
 
   it('update_draft returns INVALID_ADDRESS for bad input', async () => {

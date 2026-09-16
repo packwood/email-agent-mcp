@@ -334,6 +334,7 @@ export class MockEmailProvider implements EmailReader, EmailSender, EmailSchedul
     this.drafts.set(draftId, {
       to: [original.from],
       cc: opts?.cc,
+      bcc: opts?.bcc,
       subject: `Re: ${original.subject}`,
       body,
       bodyHtml: opts?.bodyHtml,
@@ -384,6 +385,7 @@ export class MockEmailProvider implements EmailReader, EmailSender, EmailSchedul
       ...existing,
       ...(msg.to !== undefined && { to: msg.to }),
       ...(msg.cc !== undefined && { cc: msg.cc }),
+      ...(msg.bcc !== undefined && { bcc: msg.bcc }),
       ...(msg.subject !== undefined && { subject: msg.subject }),
       ...(msg.body !== undefined && { body: msg.body }),
       ...(msg.bodyHtml !== undefined && { bodyHtml: msg.bodyHtml }),

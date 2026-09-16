@@ -23,6 +23,8 @@ const ReplyToEmailInput = z.object({
   body: z.string(),
   mailbox: z.string().optional(),
   cc: z.array(z.string()).optional(),
+  bcc: z.array(z.string()).optional()
+    .describe('Bcc recipients. Parsed with the same name-address grammar as to/cc. Draft replies bypass the send allowlist; the send path gates every effective To/Cc/Bcc address.'),
   draft: z.boolean().optional(),
   include_quoted: z.boolean().optional().default(false)
     .describe('Include provider-assembled quoted history in preview.bodyHtml for draft replies. This affects only the preview, never the stored or sent body.'),
@@ -78,6 +80,7 @@ function collectReplyAllowlistRecipients(
   ctx: ActionContext,
   originalMessage: EmailMessage,
   parsedCc: EmailAddress[],
+  parsedBcc: EmailAddress[],
   replyAll: boolean,
 ): string[] {
   const currentMailboxEmails = collectCurrentMailboxEmails(ctx);
@@ -105,6 +108,10 @@ function collectReplyAllowlistRecipients(
   }
 
   for (const recipient of parsedCc) {
+    addRecipient(recipient.email);
+  }
+
+  for (const recipient of parsedBcc) {
     addRecipient(recipient.email);
   }
 
@@ -141,7 +148,7 @@ export const replyToEmailAction: EmailAction<
 
     // Parse cc once — name-address strings ('Jane <jane@x>') become {name, email}.
     // Errors return INVALID_ADDRESS before any provider call or retry logic.
-    const parsed = parseRecipients({ cc: input.cc });
+    const parsed = parseRecipients({ cc: input.cc, bcc: input.bcc });
     if ('error' in parsed) {
       return { success: false, error: parsed.error };
     }
@@ -173,6 +180,7 @@ export const replyToEmailAction: EmailAction<
       try {
         const draftResult = await ctx.provider.createReplyDraft(input.message_id, bodyPlain, {
           cc: parsed.cc,
+          bcc: parsed.bcc.length > 0 ? parsed.bcc : undefined,
           bodyHtml,
           replyAll: input.reply_all,
           attachments,
@@ -199,7 +207,13 @@ export const replyToEmailAction: EmailAction<
 
     // Send path — check every effective recipient against the allowlist
     const originalMessage = await ctx.provider.getMessage(input.message_id);
-    const replyRecipients = collectReplyAllowlistRecipients(ctx, originalMessage, parsed.cc, input.reply_all !== false);
+    const replyRecipients = collectReplyAllowlistRecipients(
+      ctx,
+      originalMessage,
+      parsed.cc,
+      parsed.bcc,
+      input.reply_all !== false,
+    );
 
     // Check send allowlist — reply recipients must also be allowed
     const allowlistError = checkSendAllowlist(replyRecipients, ctx.sendAllowlist);
@@ -226,6 +240,7 @@ export const replyToEmailAction: EmailAction<
       const result = await withRetry(
         () => ctx.provider.replyToMessage(input.message_id, bodyPlain, {
           cc: parsed.cc,
+          bcc: parsed.bcc.length > 0 ? parsed.bcc : undefined,
           bodyHtml,
           replyAll: input.reply_all,
           attachments,

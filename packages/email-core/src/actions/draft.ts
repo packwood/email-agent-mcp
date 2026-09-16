@@ -51,6 +51,8 @@ const DraftOutput = z.object({
 const CreateDraftInput = z.object({
   to: z.string().or(z.array(z.string())).optional(),
   cc: z.array(z.string()).optional(),
+  bcc: z.array(z.string()).optional()
+    .describe('Bcc recipients. Parsed with the same name-address grammar as to/cc. Drafts bypass the send allowlist; send_draft gates every To/Cc/Bcc address.'),
   subject: z.string().optional(),
   body: z.string().optional(),
   body_file: z.string().optional(),
@@ -90,7 +92,7 @@ export const createDraftAction: EmailAction<
       return { success: false, error: fields.error };
     }
 
-    const { to, cc, subject, replyTo, format, forceBlack } = fields;
+    const { to, cc, bcc, subject, replyTo, format, forceBlack } = fields;
     let { body } = fields;
 
     // Resolve attachments (sandboxed path reads + validation)
@@ -109,7 +111,7 @@ export const createDraftAction: EmailAction<
     const recipients = Array.isArray(to) ? to : [to!];
 
     // Parse name-address strings into {name, email} once before any provider call.
-    const parsed = parseRecipients({ to: recipients, cc });
+    const parsed = parseRecipients({ to: recipients, cc, bcc });
     if ('error' in parsed) {
       return { success: false, error: parsed.error };
     }
@@ -146,6 +148,7 @@ export const createDraftAction: EmailAction<
       try {
         const result = await ctx.provider.createReplyDraft(replyTo, body, {
           cc: parsed.cc,
+          bcc: parsed.bcc.length > 0 ? parsed.bcc : undefined,
           bodyHtml: outBodyHtml,
           attachments: attachments.length > 0 ? attachments : undefined,
           replyAll: input.reply_all,
@@ -171,6 +174,7 @@ export const createDraftAction: EmailAction<
       const result = await ctx.provider.createDraft({
         to: parsed.to,
         cc: parsed.cc,
+        bcc: parsed.bcc.length > 0 ? parsed.bcc : undefined,
         subject: subject!,
         body,
         bodyHtml: outBodyHtml,
@@ -437,6 +441,8 @@ const UpdateDraftInput = z.object({
   draft_id: z.string(),
   to: z.string().or(z.array(z.string())).optional(),
   cc: z.array(z.string()).optional(),
+  bcc: z.array(z.string()).optional()
+    .describe('Bcc recipients. Parsed with the same name-address grammar as to/cc. An omitted list leaves existing Bcc unchanged; an empty array clears it.'),
   subject: z.string().optional(),
   body: z.string().optional(),
   body_file: z.string().optional(),
@@ -483,7 +489,7 @@ export const updateDraftAction: EmailAction<
       return { success: false, error: fields.error };
     }
 
-    const { to, cc, subject, format, forceBlack } = fields;
+    const { to, cc, bcc, subject, format, forceBlack } = fields;
     let { body } = fields;
     const hasBodyEdit = input.body !== undefined || input.body_file !== undefined;
 
@@ -528,16 +534,18 @@ export const updateDraftAction: EmailAction<
 
     // Build partial update — parse name-address strings only for fields the caller actually provided.
     const partial: Partial<import('../types.js').ComposeMessage> = {};
-    if (to !== undefined || cc !== undefined) {
+    if (to !== undefined || cc !== undefined || bcc !== undefined) {
       const parsed = parseRecipients({
         to: to !== undefined ? (Array.isArray(to) ? to : [to]) : undefined,
         cc,
+        bcc,
       });
       if ('error' in parsed) {
         return { success: false, error: parsed.error };
       }
       if (to !== undefined) partial.to = parsed.to;
       if (cc !== undefined) partial.cc = parsed.cc;
+      if (bcc !== undefined) partial.bcc = parsed.bcc;
     }
     if (subject) partial.subject = subject;
 

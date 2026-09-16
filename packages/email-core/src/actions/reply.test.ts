@@ -229,6 +229,40 @@ describe('email-write/Message ID Validation', () => {
     expect(result.success).toBe(false);
     expect(result.error!.code).toBe('INVALID_MESSAGE_ID');
   });
+
+  it('reply draft accepts bcc and bypasses the allowlist', async () => {
+    const result = await replyToEmailAction.run(ctx, {
+      message_id: VALID_MSG_ID,
+      body: 'Thanks',
+      draft: true,
+      bcc: ['"Counsel" <counsel@outside.com>'],
+    });
+    expect(result.success).toBe(true);
+    const draft = [...provider.getDrafts().values()][0]!;
+    expect(draft.bcc).toEqual([{ name: 'Counsel', email: 'counsel@outside.com' }]);
+    expect(provider.getSentMessages()).toHaveLength(0);
+  });
+
+  it('reply send path gates bcc against the allowlist', async () => {
+    const result = await replyToEmailAction.run(ctx, {
+      message_id: VALID_MSG_ID,
+      body: 'Thanks',
+      bcc: ['secret@blocked.com'],
+    });
+    expect(result.success).toBe(false);
+    expect(result.error?.code).toBe('ALLOWLIST_BLOCKED');
+    expect(provider.getSentMessages()).toHaveLength(0);
+  });
+
+  it('reply send path includes an allowed bcc', async () => {
+    const result = await replyToEmailAction.run(ctx, {
+      message_id: VALID_MSG_ID,
+      body: 'Thanks',
+      bcc: ['audit@lawfirm.com'],
+    });
+    expect(result.success).toBe(true);
+    expect(provider.getSentMessages()[0]!.bcc).toEqual([{ email: 'audit@lawfirm.com' }]);
+  });
 });
 
 describe('email-write/Body Rendering', () => {
