@@ -11,6 +11,7 @@ import type {
   EmailError,
   ScheduledSend,
   ScheduledSendResult,
+  ForwardOptions,
 } from '../types.js';
 
 export interface EmailReader {
@@ -44,6 +45,7 @@ export interface EmailSender {
   createDraft(msg: ComposeMessage): Promise<DraftResult>;
   sendDraft(draftId: string): Promise<SendResult>;
   createReplyDraft?(messageId: string, body: string, opts?: ReplyOptions): Promise<DraftResult>;
+  createForwardDraft?(messageId: string, opts: ForwardOptions): Promise<DraftResult>;
   getDraftReplyStatus?(draftId: string): Promise<DraftReplyStatus>;
   updateDraft?(draftId: string, msg: Partial<ComposeMessage>): Promise<DraftResult>;
 }

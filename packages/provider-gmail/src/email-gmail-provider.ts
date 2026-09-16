@@ -10,6 +10,7 @@ import type {
   DraftResult,
   ListOptions,
   ReplyOptions,
+  ForwardOptions,
   DownloadedAttachment,
   OutboundAttachment,
   DraftReplyStatus,
@@ -320,6 +321,60 @@ export class GmailEmailProvider {
         },
       };
     }
+  }
+
+  async createForwardDraft(messageId: string, opts: ForwardOptions): Promise<DraftResult> {
+    try {
+      const original = await this.getMessage(messageId);
+      const forwardedAttachments = await this.collectForwardedAttachments(original);
+      const extra = opts.attachments ?? [];
+      const attachments = forwardedAttachments.length + extra.length > 0
+        ? [...forwardedAttachments, ...extra]
+        : undefined;
+      const quoted = formatForwardedBodies(original, opts.comment ?? '', opts.bodyHtml);
+      const references = buildReferences(original.references, original.messageId);
+
+      const raw = buildRawMessage(
+        {
+          to: opts.to,
+          cc: opts.cc,
+          subject: prefixFwdSubject(original.subject),
+          body: quoted.body,
+          bodyHtml: quoted.bodyHtml,
+          attachments,
+        },
+        {
+          inReplyTo: original.messageId,
+          references,
+          draftOrigin: 'reply',
+        },
+      );
+
+      const result = await this.client.createDraft(raw, original.threadId);
+      return { success: true, draftId: result.id };
+    } catch (err) {
+      return {
+        success: false,
+        error: {
+          code: 'DRAFT_FAILED',
+          message: err instanceof Error ? err.message : String(err),
+          recoverable: false,
+        },
+      };
+    }
+  }
+
+  private async collectForwardedAttachments(original: EmailMessage): Promise<OutboundAttachment[]> {
+    const attachments: OutboundAttachment[] = [];
+    for (const att of original.attachments ?? []) {
+      const downloaded = await this.downloadAttachment(original.id, att.id);
+      attachments.push({
+        filename: downloaded.filename,
+        content: downloaded.content,
+        mimeType: downloaded.mimeType,
+      });
+    }
+    return attachments;
   }
 
   async updateDraft(draftId: string, msg: Partial<ComposeMessage>): Promise<DraftResult> {
@@ -921,6 +976,61 @@ function mergeAddressLists(
 function prefixReSubject(subject: string): string {
   if (/^re:\s*/i.test(subject)) return subject;
   return `Re: ${subject}`;
+}
+
+function prefixFwdSubject(subject: string): string {
+  if (/^fwd:\s*/i.test(subject) || /^fw:\s*/i.test(subject)) return subject;
+  return `Fwd: ${subject}`;
+}
+
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+function formatAddressLine(addr: EmailAddress): string {
+  return addr.name ? `${addr.name} <${addr.email}>` : addr.email;
+}
+
+function formatForwardedBodies(
+  original: EmailMessage,
+  commentPlain: string,
+  commentHtml: string | undefined,
+): { body: string; bodyHtml?: string } {
+  const fromLine = formatAddressLine(original.from);
+  const toLine = original.to.map(formatAddressLine).join(', ');
+  const dateLine = original.receivedAt;
+  const headerBlock = [
+    '---------- Forwarded message ---------',
+    `From: ${fromLine}`,
+    `Date: ${dateLine}`,
+    `Subject: ${original.subject}`,
+    `To: ${toLine}`,
+  ].join('\n');
+  const originalPlain = original.body ?? '';
+  const body = [commentPlain, '', headerBlock, '', originalPlain].join('\n');
+
+  if (commentHtml === undefined && original.bodyHtml === undefined) {
+    return { body };
+  }
+
+  const commentFragment = commentHtml !== undefined
+    ? commentHtml
+    : (commentPlain ? `<div>${escapeHtml(commentPlain).replace(/\n/g, '<br>')}</div>` : '');
+  const quotedHtml = original.bodyHtml
+    ?? `<pre>${escapeHtml(originalPlain)}</pre>`;
+  const bodyHtml = `${commentFragment}`
+    + '<div>---------- Forwarded message ---------<br>'
+    + `<b>From:</b> ${escapeHtml(fromLine)}<br>`
+    + `<b>Date:</b> ${escapeHtml(dateLine)}<br>`
+    + `<b>Subject:</b> ${escapeHtml(original.subject)}<br>`
+    + `<b>To:</b> ${escapeHtml(toLine)}<br>`
+    + '<br></div>'
+    + quotedHtml;
+  return { body, bodyHtml };
 }
 
 /**

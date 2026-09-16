@@ -1020,6 +1020,94 @@ describe('provider-microsoft/Draft-Then-Send via createReplyAll', () => {
   });
 });
 
+describe('provider-microsoft/Forward Drafts', () => {
+  it('Scenario: createForwardDraft PATCHes recipients and comment without sending', async () => {
+    const client = createMockClient({
+      post: vi.fn().mockResolvedValueOnce(quotedReplyResponse({ id: 'fwd-draft-1' })),
+    });
+    const provider = new GraphEmailProvider(client);
+
+    const result = await provider.createForwardDraft('msg-1', {
+      to: [{ email: 'bob@corp.com', name: 'Bob' }],
+      cc: [{ email: 'carol@corp.com' }],
+      comment: 'Please review',
+      bodyHtml: '<p>Please review</p>',
+    });
+
+    expect(result).toEqual({ success: true, draftId: 'fwd-draft-1' });
+    expect(client.post).toHaveBeenCalledTimes(1);
+    expect(client.post).toHaveBeenCalledWith(
+      '/me/messages/msg-1/createForward',
+      {},
+    );
+    expect(client.post).not.toHaveBeenCalledWith(
+      expect.stringContaining('/send'),
+      expect.anything(),
+    );
+    const patchArgs = (client.patch as ReturnType<typeof vi.fn>).mock.calls[0]!;
+    expect(patchArgs[0]).toBe('/me/messages/fwd-draft-1');
+    const patch = patchArgs[1] as {
+      toRecipients: Array<{ emailAddress: { address: string; name?: string } }>;
+      ccRecipients: Array<{ emailAddress: { address: string } }>;
+      body: { content: string };
+      singleValueExtendedProperties: Array<{ id: string; value: string }>;
+    };
+    expect(patch.toRecipients).toEqual([
+      { emailAddress: { address: 'bob@corp.com', name: 'Bob' } },
+    ]);
+    expect(patch.ccRecipients.map(r => r.emailAddress.address)).toEqual(['carol@corp.com']);
+    expect(patch.body.content).toContain('<p>Please review</p>');
+    expect(patch.body.content).toContain('From:</b> Alice');
+    expect(patch.singleValueExtendedProperties).toContainEqual({
+      id: 'String {66f5a359-4659-4830-9070-00047ec6ac6e} Name AgentEmailDraftOrigin',
+      value: 'reply',
+    });
+  });
+
+  it('Scenario: createForwardDraft with no comment leaves Graph quoted body in place', async () => {
+    const client = createMockClient({
+      post: vi.fn().mockResolvedValueOnce(quotedReplyResponse({ id: 'fwd-draft-2' })),
+    });
+    const provider = new GraphEmailProvider(client);
+
+    const result = await provider.createForwardDraft('msg-1', {
+      to: [{ email: 'bob@corp.com' }],
+    });
+
+    expect(result.success).toBe(true);
+    const patch = (client.patch as ReturnType<typeof vi.fn>).mock.calls[0]![1] as Record<string, unknown>;
+    expect(patch).not.toHaveProperty('body');
+    expect(patch.toRecipients).toEqual([
+      { emailAddress: { address: 'bob@corp.com', name: undefined } },
+    ]);
+  });
+
+  it('Scenario: createForwardDraft posts caller attachments after the PATCH', async () => {
+    const client = createMockClient({
+      post: vi.fn()
+        .mockResolvedValueOnce(quotedReplyResponse({ id: 'fwd-att' }))
+        .mockResolvedValueOnce({ id: 'att-1' }),
+    });
+    const provider = new GraphEmailProvider(client);
+    const pdf = Buffer.from('%PDF-1.4\nbytes', 'utf-8');
+
+    const result = await provider.createForwardDraft('msg-1', {
+      to: [{ email: 'bob@corp.com' }],
+      attachments: [{ filename: 'note.pdf', content: pdf, mimeType: 'application/pdf' }],
+    });
+
+    expect(result.success).toBe(true);
+    const attCall = (client.post as ReturnType<typeof vi.fn>).mock.calls.find(
+      c => String(c[0]).endsWith('/attachments'),
+    );
+    expect(attCall).toBeDefined();
+    expect(client.post).not.toHaveBeenCalledWith(
+      expect.stringContaining('/send'),
+      expect.anything(),
+    );
+  });
+});
+
 describe('provider-microsoft/Deferred Delivery via Graph Extended Property', () => {
   it('Scenario: New scheduled message uses draft then send', async () => {
     const post = vi.fn()

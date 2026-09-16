@@ -7,6 +7,7 @@ import type {
   DraftResult,
   ListOptions,
   ReplyOptions,
+  ForwardOptions,
   Subscription,
   EmailAttachment,
   ScheduledSend,
@@ -133,7 +134,10 @@ export class MockEmailProvider implements EmailReader, EmailSender, EmailSchedul
         isRead: true,
         hasAttachments: (attachments?.length ?? 0) > 0,
         body: draft.body,
+        bodyHtml: draft.bodyHtml,
         attachments,
+        threadId: draft.threadId,
+        conversationId: draft.threadId,
       };
     }
 
@@ -334,6 +338,29 @@ export class MockEmailProvider implements EmailReader, EmailSender, EmailSchedul
       body,
       bodyHtml: opts?.bodyHtml,
       attachments: opts?.attachments,
+    });
+    this.replyDraftIds.add(draftId);
+    return { success: true, draftId };
+  }
+
+  async createForwardDraft(messageId: string, opts: ForwardOptions): Promise<DraftResult> {
+    this.maybeThrow();
+    const original = this.messages.find(m => m.id === messageId);
+    if (!original) {
+      throw new Error(`Message not found: ${messageId}`);
+    }
+    const draftId = `draft-${this.nextId++}`;
+    const subject = /^fwd:\s*/i.test(original.subject) || /^fw:\s*/i.test(original.subject)
+      ? original.subject
+      : `Fwd: ${original.subject}`;
+    this.drafts.set(draftId, {
+      to: opts.to,
+      cc: opts.cc,
+      subject,
+      body: opts.comment ?? '',
+      bodyHtml: opts.bodyHtml,
+      attachments: opts.attachments,
+      threadId: original.threadId ?? original.conversationId,
     });
     this.replyDraftIds.add(draftId);
     return { success: true, draftId };

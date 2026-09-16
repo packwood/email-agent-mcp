@@ -11,6 +11,7 @@ import type {
   EmailError,
   ListOptions,
   ReplyOptions,
+  ForwardOptions,
   EmailReader,
   EmailSender,
   EmailCategorizer,
@@ -1058,6 +1059,21 @@ export class GraphEmailProvider implements EmailReader, EmailSender, EmailSchedu
     }
   }
 
+  async createForwardDraft(messageId: string, opts: ForwardOptions): Promise<DraftResult> {
+    // POST /createForward then PATCH recipients and comment. Never send — forwarding
+    // and sending stay separate actions. Graph preserves conversationId on the draft.
+    try {
+      const draftId = await this.prepareForwardDraft(messageId, opts);
+      return { success: true, draftId };
+    } catch (err) {
+      if (err instanceof GraphAttachmentError) {
+        return { success: false, draftId: err.draftId, error: err.emailError };
+      }
+      const message = err instanceof Error ? err.message : 'Failed to create forward draft';
+      return { success: false, error: { code: 'DRAFT_FAILED', message, recoverable: false } };
+    }
+  }
+
   /**
    * Shared helper for both reply paths. Calls createReply (sender only) when
    * opts.replyAll is explicitly false, otherwise createReplyAll (sender + thread
@@ -1145,6 +1161,68 @@ export class GraphEmailProvider implements EmailReader, EmailSender, EmailSchedu
           {
             code: 'ATTACHMENT_UPLOAD_FAILED',
             message: `Reply draft was created but attaching files failed: ${err instanceof Error ? err.message : String(err)}`,
+            recoverable: false,
+          },
+          draft.id,
+        );
+      }
+    }
+
+    return draft.id;
+  }
+
+  /**
+   * POST /createForward (empty body), then PATCH comment/body and recipients.
+   * Never calls /send. Caller-supplied attachments are POSTed onto the draft
+   * after the PATCH, matching the reply two-step upload.
+   */
+  private async prepareForwardDraft(messageId: string, opts: ForwardOptions): Promise<string> {
+    const sizeError = checkGraphAttachmentLimits(opts.attachments, { checkTotal: false });
+    if (sizeError) {
+      throw new GraphAttachmentError(sizeError);
+    }
+
+    const draft = await this.client.post(
+      `${this.basePath}/messages/${encodeGraphPathId(messageId)}/createForward`,
+      {},
+    );
+    if (!draft.id) throw new Error('createForward did not return a draft id');
+
+    let draftBody = draft.body as { contentType?: string; content?: string } | undefined;
+    if (typeof draftBody?.content !== 'string' || draftBody.contentType?.toLowerCase() !== 'html') {
+      const fetched = await this.client.get(`${this.basePath}/messages/${encodeGraphPathId(draft.id)}`);
+      draftBody = fetched.body as { contentType?: string; content?: string } | undefined;
+    }
+
+    const draftContent = typeof draftBody?.content === 'string' ? draftBody.content : '';
+    const hasComment = (opts.bodyHtml !== undefined && opts.bodyHtml.length > 0)
+      || (opts.comment !== undefined && opts.comment.length > 0);
+    const patch: Record<string, unknown> = {
+      toRecipients: toGraphRecipients(opts.to),
+      singleValueExtendedProperties: [
+        { id: DRAFT_ORIGIN_PROPERTY, value: 'reply' },
+      ],
+    };
+    if (opts.cc && opts.cc.length > 0) {
+      patch.ccRecipients = toGraphRecipients(opts.cc);
+    }
+    if (hasComment) {
+      const callerFragment = opts.bodyHtml !== undefined
+        ? stripHtmlBodyWrappers(opts.bodyHtml)
+        : wrapPlainTextAsHtml(opts.comment ?? '');
+      patch.body = { contentType: 'HTML', content: truncateBody(mergeQuotedReplyHtml(draftContent, callerFragment)) };
+    }
+
+    await this.client.patch(`${this.basePath}/messages/${encodeGraphPathId(draft.id)}`, patch);
+
+    if (opts.attachments && opts.attachments.length > 0) {
+      try {
+        await this.postDraftAttachments(draft.id, opts.attachments);
+      } catch (err) {
+        throw new GraphAttachmentError(
+          {
+            code: 'ATTACHMENT_UPLOAD_FAILED',
+            message: `Forward draft was created but attaching files failed: ${err instanceof Error ? err.message : String(err)}`,
             recoverable: false,
           },
           draft.id,

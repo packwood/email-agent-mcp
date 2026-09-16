@@ -318,8 +318,8 @@ describe('mcp-transport/Lazy Provider State', () => {
     // No init has been triggered — state is still 'pending'.
     const actions = await buildLazyActions(state, noAllowlist);
 
-    // 5 custom tools + 22 email-core actions = 27 tools, no auth performed.
-    expect(actions.length).toBe(27);
+    // 5 custom tools + 23 email-core actions = 28 tools, no auth performed.
+    expect(actions.length).toBe(28);
     expect(state.status).toBe('pending');
     expect(state.initPromise).toBeNull();
     expect(state.provider).toBeNull();

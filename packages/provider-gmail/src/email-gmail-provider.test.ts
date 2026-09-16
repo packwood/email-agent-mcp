@@ -1050,6 +1050,136 @@ describe('provider-gmail/Reply Drafts', () => {
   });
 });
 
+describe('provider-gmail/Forward Drafts', () => {
+  function originalMessageMock() {
+    return {
+      id: 'msg-original',
+      threadId: 'thread-abc',
+      labelIds: ['INBOX'],
+      payload: {
+        headers: [
+          { name: 'From', value: '"Alice" <alice@corp.com>' },
+          { name: 'To', value: 'bob@corp.com' },
+          { name: 'Subject', value: 'Original thread' },
+          { name: 'Date', value: '2026-01-15T10:00:00Z' },
+          { name: 'Message-ID', value: '<msg-a@corp.com>' },
+          { name: 'References', value: '<msg-r1@corp.com>' },
+        ],
+        body: { data: Buffer.from('Original body').toString('base64url') },
+        mimeType: 'text/plain',
+      },
+      internalDate: String(new Date('2026-01-15T10:00:00Z').getTime()),
+    };
+  }
+
+  it('Scenario: createForwardDraft quotes the original in the source thread without sending', async () => {
+    const client = createMockGmailClient({
+      getMessage: vi.fn().mockResolvedValue(originalMessageMock()),
+    });
+    const provider = new GmailEmailProvider(client);
+
+    const result = await provider.createForwardDraft('msg-original', {
+      to: [{ email: 'dave@corp.com', name: 'Dave' }],
+      cc: [{ email: 'erin@corp.com' }],
+      comment: 'Please review',
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.draftId).toBe('draft-abc');
+    expect(client.createDraft).toHaveBeenCalledWith(expect.any(String), 'thread-abc');
+    expect(client.sendMessage).not.toHaveBeenCalled();
+    expect(client.sendDraft).not.toHaveBeenCalled();
+
+    const raw = lastRaw(client.createDraft as ReturnType<typeof vi.fn>);
+    expect(raw).toContain('To: "Dave" <dave@corp.com>');
+    expect(raw).toContain('Cc: erin@corp.com');
+    expect(raw).toContain('Subject: Fwd: Original thread');
+    expect(raw).toContain('X-Agent-Draft-Origin: reply');
+    expect(raw).toContain('In-Reply-To: <msg-a@corp.com>');
+    expect(raw).toContain('References: <msg-r1@corp.com> <msg-a@corp.com>');
+    expect(raw).toContain('Please review');
+    expect(raw).toContain('---------- Forwarded message ---------');
+    expect(raw).toContain('Original body');
+  });
+
+  it('Scenario: subject prefixed with Fwd: is not double-prefixed', async () => {
+    const already = {
+      ...originalMessageMock(),
+      payload: {
+        ...originalMessageMock().payload,
+        headers: [
+          ...originalMessageMock().payload.headers.filter(h => h.name !== 'Subject'),
+          { name: 'Subject', value: 'Fwd: Original thread' },
+        ],
+      },
+    };
+    const client = createMockGmailClient({
+      getMessage: vi.fn().mockResolvedValue(already),
+    });
+    const provider = new GmailEmailProvider(client);
+
+    await provider.createForwardDraft('msg-original', {
+      to: [{ email: 'dave@corp.com' }],
+    });
+
+    const raw = lastRaw(client.createDraft as ReturnType<typeof vi.fn>);
+    expect(raw).toContain('Subject: Fwd: Original thread');
+    expect(raw).not.toContain('Subject: Fwd: Fwd:');
+  });
+
+  it('Scenario: createForwardDraft reattaches original attachments', async () => {
+    const withAtt = {
+      ...originalMessageMock(),
+      payload: {
+        ...originalMessageMock().payload,
+        mimeType: 'multipart/mixed',
+        body: undefined,
+        parts: [
+          {
+            mimeType: 'text/plain',
+            body: { data: Buffer.from('Original body').toString('base64url') },
+          },
+          {
+            filename: 'report.pdf',
+            mimeType: 'application/pdf',
+            body: { attachmentId: 'att-1', size: 16 },
+          },
+        ],
+      },
+    };
+    const client = createMockGmailClient({
+      getMessage: vi.fn().mockResolvedValue(withAtt),
+    });
+    const provider = new GmailEmailProvider(client);
+
+    const result = await provider.createForwardDraft('msg-original', {
+      to: [{ email: 'dave@corp.com' }],
+    });
+
+    expect(result.success).toBe(true);
+    expect(client.getAttachment).toHaveBeenCalledWith('msg-original', 'att-1');
+    const raw = lastRaw(client.createDraft as ReturnType<typeof vi.fn>);
+    expect(raw).toContain('filename="report.pdf"');
+  });
+
+  it('Scenario: createForwardDraft returns structured DRAFT_FAILED on error', async () => {
+    const client = createMockGmailClient({
+      getMessage: vi.fn().mockResolvedValue(originalMessageMock()),
+      createDraft: vi.fn().mockRejectedValue(new Error('quota exceeded')),
+    });
+    const provider = new GmailEmailProvider(client);
+
+    const result = await provider.createForwardDraft('msg-original', {
+      to: [{ email: 'dave@corp.com' }],
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.error?.code).toBe('DRAFT_FAILED');
+    expect(result.error?.message).toMatch(/quota exceeded/);
+    expect(client.sendMessage).not.toHaveBeenCalled();
+  });
+});
+
 describe('provider-gmail/Reply Threading on Send', () => {
   function ccThreadMessageMock() {
     return {
