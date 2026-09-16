@@ -12,6 +12,7 @@ import type {
   ScheduledSend,
   ScheduledSendResult,
   ForwardOptions,
+  DraftLookupResult,
 } from '../types.js';
 
 export interface EmailReader {
@@ -24,6 +25,12 @@ export interface EmailReader {
    * same id from getMessage(draftId).
    */
   getDraftMessage?(draftId: string): Promise<EmailMessage>;
+  /**
+   * Resolve a draft by exact caller tracking id. Must not substring-match,
+   * prefix-match, or otherwise fuzzy-match. Return null when no draft carries
+   * that exact id; throw when more than one draft does.
+   */
+  findDraftByTrackingId?(trackingId: string): Promise<DraftLookupResult | null>;
   searchMessages(
     query: string,
     folder?: string,

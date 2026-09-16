@@ -14,8 +14,9 @@ import type {
   DownloadedAttachment,
   OutboundAttachment,
   DraftReplyStatus,
+  DraftLookupResult,
 } from '@usejunior/email-core';
-import { AttachmentNotFoundError } from '@usejunior/email-core';
+import { AttachmentNotFoundError, ProviderError } from '@usejunior/email-core';
 
 // Gmail label mapping
 const FOLDER_TO_LABEL: Record<string, string> = {
@@ -39,6 +40,7 @@ const ARCHIVE_SENTINEL = '__ARCHIVE__';
 // Matches Microsoft's SUBJECT_MAX_LENGTH — keeps cross-provider behaviour consistent.
 const SUBJECT_MAX_LENGTH = 255;
 const DRAFT_ORIGIN_HEADER = 'X-Agent-Draft-Origin';
+const TRACKING_HEADER = 'X-Agent-Email-Tracking-Id';
 type DraftOrigin = 'reply' | 'non_reply';
 
 export interface GmailApiClient {
@@ -68,6 +70,15 @@ export interface GmailApiClient {
    * falls back to a structured NOT_SUPPORTED error when this is missing.
    */
   updateDraft?(draftId: string, raw: string, threadId?: string): Promise<{ id: string; message: { id: string; threadId: string } }>;
+  /**
+   * List draft resources (draft id + backing message id). Optional so older
+   * concrete clients keep type-checking; findDraftByTrackingId fails closed
+   * with NOT_SUPPORTED when this is missing.
+   */
+  listDrafts?(opts?: { maxResults?: number; pageToken?: string }): Promise<{
+    drafts?: Array<{ id: string; message?: { id: string; threadId: string } }>;
+    nextPageToken?: string;
+  }>;
 }
 
 interface GmailMessagePart {
@@ -268,6 +279,7 @@ export class GmailEmailProvider {
         body,
         bodyHtml: opts?.bodyHtml,
         attachments: opts?.attachments,
+        trackingId: opts?.trackingId,
       },
       {
         inReplyTo: original.messageId,
@@ -308,6 +320,7 @@ export class GmailEmailProvider {
           body,
           bodyHtml: opts?.bodyHtml,
           attachments: opts?.attachments,
+          trackingId: opts?.trackingId,
         },
         {
           inReplyTo: original.messageId,
@@ -448,6 +461,7 @@ export class GmailEmailProvider {
         body: msg.body ?? current.body ?? '',
         bodyHtml: msg.bodyHtml ?? current.bodyHtml,
         attachments,
+        trackingId: msg.trackingId ?? getHeader(draftResource.message, TRACKING_HEADER),
       };
 
       const raw = buildRawMessage(merged, {
@@ -500,6 +514,51 @@ export class GmailEmailProvider {
     // the TRASH label and never call messages.delete, including when the caller
     // asked for a hard delete.
     await this.moveToFolder(messageId, 'trash');
+  }
+
+  async findDraftByTrackingId(trackingId: string): Promise<DraftLookupResult | null> {
+    if (!this.client.listDrafts) {
+      throw new ProviderError(
+        'NOT_SUPPORTED',
+        'Finding a draft by tracking_id requires Gmail drafts.list',
+        'gmail',
+        false,
+      );
+    }
+
+    const matches: DraftLookupResult[] = [];
+    const visitedTokens = new Set<string>();
+    let pageToken: string | undefined;
+    for (let pages = 0; pages < 100; pages++) {
+      const page = await this.client.listDrafts({
+        maxResults: 100,
+        ...(pageToken ? { pageToken } : {}),
+      });
+      for (const stub of page.drafts ?? []) {
+        if (!stub.id) continue;
+        const draft = await this.client.getDraft(stub.id);
+        const values = getHeaders(draft.message, TRACKING_HEADER);
+        if (values.length > 0 && values.every(value => value === trackingId)) {
+          matches.push({ draftId: draft.id, messageId: draft.message.id });
+        }
+      }
+      const next = page.nextPageToken;
+      if (!next) break;
+      if (visitedTokens.has(next)) throw new Error('Gmail draft pagination did not terminate');
+      visitedTokens.add(next);
+      pageToken = next;
+    }
+
+    if (matches.length === 0) return null;
+    if (matches.length > 1) {
+      throw new ProviderError(
+        'TRACKING_ID_AMBIGUOUS',
+        `Multiple drafts share tracking_id ${trackingId}`,
+        'gmail',
+        false,
+      );
+    }
+    return matches[0]!;
   }
 
   async getDraftReplyStatus(draftId: string): Promise<DraftReplyStatus> {
@@ -949,6 +1008,7 @@ function buildRawMessage(msg: ComposeMessage, opts: BuildRawOptions = {}): strin
   if (msg.bcc && msg.bcc.length > 0) headers.push(`Bcc: ${formatAddressList(msg.bcc)}`);
   headers.push(`Subject: ${escapeHeader(msg.subject)}`);
   if (opts.draftOrigin) headers.push(`${DRAFT_ORIGIN_HEADER}: ${opts.draftOrigin}`);
+  if (msg.trackingId) headers.push(`${TRACKING_HEADER}: ${escapeHeader(msg.trackingId)}`);
   if (opts.inReplyTo) headers.push(`In-Reply-To: ${escapeHeader(opts.inReplyTo)}`);
   if (opts.references && opts.references.length > 0) {
     headers.push(`References: ${opts.references.map(r => r.replace(/[\r\n]+/g, '')).join(' ')}`);

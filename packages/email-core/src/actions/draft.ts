@@ -19,6 +19,7 @@ import {
   checkRateLimit,
   handleProviderError,
   parseRecipients,
+  parseTrackingId,
   buildDraftPreview,
   resolveAttachments,
   AttachmentInputSchema,
@@ -68,6 +69,8 @@ const CreateDraftInput = z.object({
     .describe('Wrap rendered HTML in a force-black div so Outlook dark mode does not hide the text. Default true.'),
   attachments: z.array(AttachmentInputSchema).optional()
     .describe('Files to attach. Each entry takes a sandboxed `path` or inline `base64`.'),
+  tracking_id: z.string().optional()
+    .describe('Caller-supplied exact tracking id written onto the draft so a timed-out create can be reconciled instead of retried. Lookup is exact, never fuzzy.'),
 });
 
 export const createDraftAction: EmailAction<
@@ -101,6 +104,11 @@ export const createDraftAction: EmailAction<
       return { success: false, error: attResult.error };
     }
     const attachments = attResult.files!;
+
+    const tracking = parseTrackingId(input.tracking_id);
+    if ('error' in tracking) {
+      return { success: false, error: tracking.error };
+    }
 
     // Validate required fields
     const requiredError = validateRequiredFields(to, subject);
@@ -152,6 +160,7 @@ export const createDraftAction: EmailAction<
           bodyHtml: outBodyHtml,
           attachments: attachments.length > 0 ? attachments : undefined,
           replyAll: input.reply_all,
+          trackingId: tracking.trackingId,
         });
         const previewResult = result.success && result.draftId
           ? await buildDraftPreview(ctx.provider, result.draftId, {
@@ -179,6 +188,7 @@ export const createDraftAction: EmailAction<
         body,
         bodyHtml: outBodyHtml,
         attachments: attachments.length > 0 ? attachments : undefined,
+        trackingId: tracking.trackingId,
       });
       const previewResult = result.success && result.draftId
         ? await buildDraftPreview(ctx.provider, result.draftId, {
@@ -326,6 +336,77 @@ export const sendDraftAction: EmailAction<
       };
     } catch (err) {
       return handleProviderError(err, 'SEND_DRAFT_FAILED');
+    }
+  },
+};
+
+// --- find_draft_by_tracking_id ---
+
+const FindDraftByTrackingIdInput = z.object({
+  tracking_id: z.string()
+    .describe('Exact caller tracking id previously supplied to create_draft or reply_to_email. Lookup is exact, never fuzzy.'),
+  mailbox: z.string().optional(),
+});
+
+const FindDraftByTrackingIdOutput = z.object({
+  success: z.boolean(),
+  draftId: z.string().optional(),
+  messageId: z.string().optional(),
+  error: z.object({
+    code: z.string(),
+    message: z.string(),
+    recoverable: z.boolean(),
+    availableMailboxes: z.array(z.string()).optional(),
+    defaultMailbox: z.string().optional(),
+  }).optional(),
+});
+
+export const findDraftByTrackingIdAction: EmailAction<
+  z.infer<typeof FindDraftByTrackingIdInput>,
+  z.infer<typeof FindDraftByTrackingIdOutput>
+> = {
+  name: 'find_draft_by_tracking_id',
+  description: 'Find a draft by exact caller tracking_id. Returns { draftId, messageId } or DRAFT_NOT_FOUND. Never fuzzy-matches.',
+  input: FindDraftByTrackingIdInput,
+  output: FindDraftByTrackingIdOutput,
+  annotations: { readOnlyHint: true, destructiveHint: false },
+  run: async (ctx, input) => {
+    const mailboxError = checkMailboxRequired(input.mailbox, ctx.allMailboxes);
+    if (mailboxError) {
+      return { success: false, error: mailboxError };
+    }
+
+    const tracking = parseTrackingId(input.tracking_id);
+    if ('error' in tracking) {
+      return { success: false, error: tracking.error };
+    }
+
+    if (!ctx.provider.findDraftByTrackingId) {
+      return {
+        success: false,
+        error: {
+          code: 'NOT_SUPPORTED',
+          message: 'Finding a draft by tracking_id is not supported by this email provider',
+          recoverable: false,
+        },
+      };
+    }
+
+    try {
+      const found = await ctx.provider.findDraftByTrackingId(tracking.trackingId!);
+      if (!found) {
+        return {
+          success: false,
+          error: {
+            code: 'DRAFT_NOT_FOUND',
+            message: `No draft found with tracking_id ${tracking.trackingId}`,
+            recoverable: false,
+          },
+        };
+      }
+      return { success: true, draftId: found.draftId, messageId: found.messageId };
+    } catch (err) {
+      return handleProviderError(err, 'DRAFT_LOOKUP_FAILED');
     }
   },
 };

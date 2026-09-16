@@ -12,6 +12,7 @@ import type {
   EmailAttachment,
   ScheduledSend,
   ScheduledSendResult,
+  DraftLookupResult,
 } from '../types.js';
 import {
   ProviderError,
@@ -144,6 +145,26 @@ export class MockEmailProvider implements EmailReader, EmailSender, EmailSchedul
     throw new Error(`Message not found: ${id}`);
   }
 
+  async findDraftByTrackingId(trackingId: string): Promise<DraftLookupResult | null> {
+    this.maybeThrow();
+    const matches: DraftLookupResult[] = [];
+    for (const [draftId, draft] of this.drafts) {
+      if (draft.trackingId === trackingId) {
+        matches.push({ draftId, messageId: draftId });
+      }
+    }
+    if (matches.length === 0) return null;
+    if (matches.length > 1) {
+      throw new ProviderError(
+        'TRACKING_ID_AMBIGUOUS',
+        `Multiple drafts share tracking_id ${trackingId}`,
+        'mock',
+        false,
+      );
+    }
+    return matches[0]!;
+  }
+
   async searchMessages(query: string, _folder?: string, limit?: number, offset?: number): Promise<EmailMessage[]> {
     this.maybeThrow();
     const lowerQuery = query.toLowerCase();
@@ -247,6 +268,7 @@ export class MockEmailProvider implements EmailReader, EmailSender, EmailSchedul
       body,
       bodyHtml: opts?.bodyHtml,
       attachments: opts?.attachments,
+      trackingId: opts?.trackingId,
     });
 
     return { success: true, messageId: id };
@@ -339,6 +361,7 @@ export class MockEmailProvider implements EmailReader, EmailSender, EmailSchedul
       body,
       bodyHtml: opts?.bodyHtml,
       attachments: opts?.attachments,
+      trackingId: opts?.trackingId,
     });
     this.replyDraftIds.add(draftId);
     return { success: true, draftId };

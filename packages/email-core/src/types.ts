@@ -155,6 +155,11 @@ export interface ReplyOptions {
    * historical reply-all default.
    */
   replyAll?: boolean;
+  /**
+   * Caller-supplied tracking id, written onto the reply/draft so a timed-out
+   * create can be reconciled by exact lookup instead of retried.
+   */
+  trackingId?: string;
 }
 
 export interface ForwardOptions {

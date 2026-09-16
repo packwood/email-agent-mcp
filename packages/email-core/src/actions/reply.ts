@@ -11,6 +11,7 @@ import {
   checkRateLimit,
   handleProviderError,
   parseRecipients,
+  parseTrackingId,
   buildDraftPreview,
   resolveAttachments,
   AttachmentInputSchema,
@@ -36,6 +37,8 @@ const ReplyToEmailInput = z.object({
     .describe('Wrap rendered HTML in a force-black div so Outlook dark mode does not hide the text. Default true.'),
   attachments: z.array(AttachmentInputSchema).optional()
     .describe('Files to attach. Each entry takes a sandboxed `path` or inline `base64`.'),
+  tracking_id: z.string().optional()
+    .describe('Caller-supplied exact tracking id written onto the reply/draft so a timed-out create can be reconciled instead of retried. Lookup is exact, never fuzzy.'),
 });
 
 const ReplyToEmailOutput = z.object({
@@ -160,6 +163,11 @@ export const replyToEmailAction: EmailAction<
     }
     const attachments = attResult.files!.length > 0 ? attResult.files : undefined;
 
+    const tracking = parseTrackingId(input.tracking_id);
+    if ('error' in tracking) {
+      return { success: false, error: tracking.error };
+    }
+
     // Render body: markdown → HTML by default
     const rendered = renderEmailBody(input.body, { format: input.format, forceBlack: input.force_black });
     const bodyPlain = rendered.body;
@@ -184,6 +192,7 @@ export const replyToEmailAction: EmailAction<
           bodyHtml,
           replyAll: input.reply_all,
           attachments,
+          trackingId: tracking.trackingId,
         });
         const previewResult = draftResult.success && draftResult.draftId
           ? await buildDraftPreview(ctx.provider, draftResult.draftId, {
@@ -244,6 +253,7 @@ export const replyToEmailAction: EmailAction<
           bodyHtml,
           replyAll: input.reply_all,
           attachments,
+          trackingId: tracking.trackingId,
         }),
         { maxRetries: 3, baseDelay: 1000 },
       );

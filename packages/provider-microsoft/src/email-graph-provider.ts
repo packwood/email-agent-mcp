@@ -27,6 +27,7 @@ import type {
   EmailScheduledSender,
   DraftReplyStatus,
   SearchProviderOptions,
+  DraftLookupResult,
 } from '@usejunior/email-core';
 import { AttachmentNotSupportedError, AttachmentNotFoundError, ProviderError } from '@usejunior/email-core';
 import { MAX_READ_ATTEMPTS, readRetryDelayMs } from './throttle.js';
@@ -900,6 +901,7 @@ export class GraphEmailProvider implements EmailReader, EmailSender, EmailSchedu
       bccRecipients: toGraphRecipients(msg.bcc),
       singleValueExtendedProperties: [
         { id: DRAFT_ORIGIN_PROPERTY, value: 'non_reply' },
+        ...(msg.trackingId ? [{ id: TRACKING_PROPERTY, value: msg.trackingId }] : []),
       ],
     };
     if (msg.attachments && msg.attachments.length > 0) {
@@ -1139,6 +1141,7 @@ export class GraphEmailProvider implements EmailReader, EmailSender, EmailSchedu
       body: { contentType: 'HTML', content: truncateBody(merged) },
       singleValueExtendedProperties: [
         { id: DRAFT_ORIGIN_PROPERTY, value: 'reply' },
+        ...(opts?.trackingId ? [{ id: TRACKING_PROPERTY, value: opts.trackingId }] : []),
       ],
     };
 
@@ -1318,6 +1321,38 @@ export class GraphEmailProvider implements EmailReader, EmailSender, EmailSchedu
     }
 
     return { success: true, draftId };
+  }
+
+  async findDraftByTrackingId(trackingId: string): Promise<DraftLookupResult | null> {
+    const escaped = trackingId.replace(/'/g, "''");
+    const filter = `singleValueExtendedProperties/Any(ep: ep/id eq '${TRACKING_PROPERTY}' and ep/value eq '${escaped}')`;
+    const propertyFilter = `$filter=id eq '${TRACKING_PROPERTY}'`;
+    const url = `${this.basePath}/mailFolders/drafts/messages`
+      + `?$filter=${encodeURIComponent(filter)}`
+      + `&$select=id,isDraft`
+      + `&$expand=singleValueExtendedProperties(${propertyFilter})`
+      + `&$top=10`;
+    const response = await this.client.get(url) as GraphMessagePageResponse;
+    const matches: DraftLookupResult[] = [];
+    for (const message of response.value ?? []) {
+      if (message.isDraft !== true) continue;
+      const stamps = (message.singleValueExtendedProperties ?? []).filter(
+        property => property.id.toLowerCase() === TRACKING_PROPERTY.toLowerCase(),
+      );
+      if (stamps.length === 0) continue;
+      if (!stamps.every(property => property.value === trackingId)) continue;
+      matches.push({ draftId: message.id, messageId: message.id });
+    }
+    if (matches.length === 0) return null;
+    if (matches.length > 1) {
+      throw new ProviderError(
+        'TRACKING_ID_AMBIGUOUS',
+        `Multiple drafts share tracking_id ${trackingId}`,
+        'microsoft',
+        false,
+      );
+    }
+    return matches[0]!;
   }
 
   /**

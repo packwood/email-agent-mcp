@@ -44,6 +44,27 @@ export function checkMailboxRequired(
   return null;
 }
 
+// --- tracking_id ---
+
+/** Exact-match tracking ids only. Rejects empty, whitespace, and header/OData metacharacters. */
+export const TRACKING_ID_PATTERN = /^[A-Za-z0-9._:-]{1,128}$/;
+
+export function parseTrackingId(
+  value: string | undefined,
+): { trackingId?: string } | { error: ActionError } {
+  if (value === undefined) return {};
+  if (!TRACKING_ID_PATTERN.test(value)) {
+    return {
+      error: {
+        code: 'INVALID_TRACKING_ID',
+        message: 'tracking_id must be 1-128 characters of A-Z, a-z, 0-9, ".", "_", ":", or "-" and is matched exactly on lookup',
+        recoverable: false,
+      },
+    };
+  }
+  return { trackingId: value };
+}
+
 // --- resolveComposeFields ---
 
 export interface ComposeFields {

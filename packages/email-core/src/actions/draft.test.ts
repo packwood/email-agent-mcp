@@ -6,6 +6,7 @@ import { createHash } from 'node:crypto';
 import { MockEmailProvider } from '../testing/mock-provider.js';
 import {
   createDraftAction,
+  findDraftByTrackingIdAction,
   inspectDraftExactAction,
   sendDraftAction,
   updateDraftAction,
@@ -1608,5 +1609,117 @@ describe('email-write/Reply Scope Control', () => {
       expect.any(String),
       expect.objectContaining({ replyAll: false }),
     );
+  });
+});
+
+describe('email-write/Caller Tracking Id', () => {
+  it('create_draft threads tracking_id onto ComposeMessage', async () => {
+    const result = await createDraftAction.run(ctx, {
+      to: 'alice@allowed.com',
+      subject: 'Tracked',
+      body: 'Hello',
+      tracking_id: 'create-timeout-1',
+    });
+
+    expect(result.success).toBe(true);
+    expect(provider.getDrafts().get(result.draftId!)!.trackingId).toBe('create-timeout-1');
+  });
+
+  it('create_draft reply path threads tracking_id onto ReplyOptions', async () => {
+    provider.addMessage({
+      id: 'orig-tracked-msg',
+      subject: 'Original',
+      from: { email: 'partner@allowed.com' },
+      to: [{ email: 'me@company.com' }],
+      receivedAt: '2024-01-01T00:00:00Z',
+      isRead: true,
+      hasAttachments: false,
+    });
+    const draftSpy = vi.spyOn(provider, 'createReplyDraft');
+
+    const result = await createDraftAction.run(ctx, {
+      reply_to: 'orig-tracked-msg',
+      to: 'partner@allowed.com',
+      subject: 'Re: Original',
+      body: 'Tracked reply draft.',
+      tracking_id: 'reply-draft-1',
+    });
+
+    expect(result.success).toBe(true);
+    expect(draftSpy).toHaveBeenCalledWith(
+      'orig-tracked-msg',
+      expect.any(String),
+      expect.objectContaining({ trackingId: 'reply-draft-1' }),
+    );
+    expect(provider.getDrafts().get(result.draftId!)!.trackingId).toBe('reply-draft-1');
+  });
+
+  it('create_draft rejects a tracking_id that cannot be matched exactly', async () => {
+    const result = await createDraftAction.run(ctx, {
+      to: 'alice@allowed.com',
+      subject: 'Bad id',
+      body: 'Hello',
+      tracking_id: 'has space',
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.error?.code).toBe('INVALID_TRACKING_ID');
+    expect(provider.getDrafts().size).toBe(0);
+  });
+
+  it('find_draft_by_tracking_id returns the exact draft and not a prefix neighbor', async () => {
+    const created = await createDraftAction.run(ctx, {
+      to: 'alice@allowed.com',
+      subject: 'Exact',
+      body: 'Hello',
+      tracking_id: 'track-100',
+    });
+    await createDraftAction.run(ctx, {
+      to: 'alice@allowed.com',
+      subject: 'Neighbor',
+      body: 'Hello',
+      tracking_id: 'track-1000',
+    });
+
+    const found = await findDraftByTrackingIdAction.run(ctx, { tracking_id: 'track-100' });
+    const missing = await findDraftByTrackingIdAction.run(ctx, { tracking_id: 'track-10' });
+
+    expect(found).toEqual({
+      success: true,
+      draftId: created.draftId,
+      messageId: created.draftId,
+    });
+    expect(missing).toMatchObject({
+      success: false,
+      error: { code: 'DRAFT_NOT_FOUND', recoverable: false },
+    });
+  });
+
+  it('find_draft_by_tracking_id fails closed when two drafts share the same id', async () => {
+    await createDraftAction.run(ctx, {
+      to: 'alice@allowed.com',
+      subject: 'One',
+      body: 'Hello',
+      tracking_id: 'dup-id',
+    });
+    await createDraftAction.run(ctx, {
+      to: 'alice@allowed.com',
+      subject: 'Two',
+      body: 'Hello',
+      tracking_id: 'dup-id',
+    });
+
+    const result = await findDraftByTrackingIdAction.run(ctx, { tracking_id: 'dup-id' });
+    expect(result.success).toBe(false);
+    expect(result.error?.code).toBe('TRACKING_ID_AMBIGUOUS');
+  });
+
+  it('find_draft_by_tracking_id returns NOT_SUPPORTED when the provider cannot look up', async () => {
+    Object.defineProperty(provider, 'findDraftByTrackingId', { value: undefined });
+    const result = await findDraftByTrackingIdAction.run(ctx, { tracking_id: 'any-id' });
+    expect(result).toMatchObject({
+      success: false,
+      error: { code: 'NOT_SUPPORTED', recoverable: false },
+    });
   });
 });

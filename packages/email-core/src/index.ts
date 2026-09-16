@@ -68,6 +68,7 @@ export { replyToEmailAction } from './actions/reply.js';
 export { createForwardDraftAction } from './actions/forward.js';
 export {
   createDraftAction,
+  findDraftByTrackingIdAction,
   inspectDraftExactAction,
   sendDraftAction,
   updateDraftAction,

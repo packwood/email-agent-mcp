@@ -1018,6 +1018,26 @@ describe('provider-microsoft/Draft-Then-Send via createReplyAll', () => {
       value: 'reply',
     });
   });
+
+  it('createReplyDraft writes AgentEmailTrackingId when trackingId is supplied', async () => {
+    const client = createMockClient({
+      post: vi.fn().mockResolvedValueOnce(quotedReplyResponse()),
+    });
+    const provider = new GraphEmailProvider(client);
+
+    await provider.createReplyDraft('msg-1', 'reply', {
+      bodyHtml: '<p>rendered</p>',
+      trackingId: 'reply-timeout-1',
+    });
+
+    const patch = (client.patch as ReturnType<typeof vi.fn>).mock.calls[0]![1] as {
+      singleValueExtendedProperties: Array<{ id: string; value: string }>;
+    };
+    expect(patch.singleValueExtendedProperties).toContainEqual({
+      id: 'String {66f5a359-4659-4830-9070-00047ec6ac6e} Name AgentEmailTrackingId',
+      value: 'reply-timeout-1',
+    });
+  });
 });
 
 describe('provider-microsoft/Forward Drafts', () => {
@@ -1721,6 +1741,114 @@ describe('provider-microsoft/Sent Message Tracking', () => {
       (p: { value: string }) => p.value === 'tracking-123',
     );
     expect(trackingProp).toBeDefined();
+  });
+});
+
+describe('provider-microsoft/Draft Tracking Id', () => {
+  const trackingProperty = 'String {66f5a359-4659-4830-9070-00047ec6ac6e} Name AgentEmailTrackingId';
+
+  it('createDraft writes AgentEmailTrackingId when trackingId is supplied', async () => {
+    const client = createMockClient();
+    const provider = new GraphEmailProvider(client);
+
+    await provider.createDraft({
+      to: [{ email: 'alice@corp.com' }],
+      subject: 'Tracked draft',
+      body: 'Hello',
+      trackingId: 'create-timeout-1',
+    });
+
+    const payload = (client.post as ReturnType<typeof vi.fn>).mock.calls[0]![1] as {
+      singleValueExtendedProperties: Array<{ id: string; value: string }>;
+    };
+    expect(payload.singleValueExtendedProperties).toContainEqual({
+      id: trackingProperty,
+      value: 'create-timeout-1',
+    });
+  });
+
+  it('createDraft omits AgentEmailTrackingId when trackingId is absent', async () => {
+    const client = createMockClient();
+    const provider = new GraphEmailProvider(client);
+
+    await provider.createDraft({
+      to: [{ email: 'alice@corp.com' }],
+      subject: 'Untracked draft',
+      body: 'Hello',
+    });
+
+    const payload = (client.post as ReturnType<typeof vi.fn>).mock.calls[0]![1] as {
+      singleValueExtendedProperties: Array<{ id: string; value: string }>;
+    };
+    expect(payload.singleValueExtendedProperties.some(p => p.id === trackingProperty)).toBe(false);
+  });
+
+  it('findDraftByTrackingId uses an exact extended-property filter and ignores a prefix neighbor', async () => {
+    const get = vi.fn().mockResolvedValue({
+      value: [{
+        id: 'draft-exact',
+        isDraft: true,
+        singleValueExtendedProperties: [{
+          id: trackingProperty,
+          value: 'track-100',
+        }],
+      }],
+    });
+    const provider = new GraphEmailProvider(createMockClient({ get }));
+
+    const found = await provider.findDraftByTrackingId('track-100');
+
+    expect(found).toEqual({ draftId: 'draft-exact', messageId: 'draft-exact' });
+    const url = decodeURIComponent((get.mock.calls[0]![0] as string));
+    expect(url).toContain("/mailFolders/drafts/messages");
+    expect(url).toContain(`ep/id eq '${trackingProperty}'`);
+    expect(url).toContain("ep/value eq 'track-100'");
+    expect(url).not.toContain('contains(');
+    expect(url).not.toContain('startswith(');
+  });
+
+  it('findDraftByTrackingId returns null when the exact value is absent', async () => {
+    const provider = new GraphEmailProvider(createMockClient({
+      get: vi.fn().mockResolvedValue({ value: [] }),
+    }));
+    await expect(provider.findDraftByTrackingId('missing-id')).resolves.toBeNull();
+  });
+
+  it('findDraftByTrackingId rejects a Graph hit whose stored value is not an exact match', async () => {
+    const provider = new GraphEmailProvider(createMockClient({
+      get: vi.fn().mockResolvedValue({
+        value: [{
+          id: 'draft-neighbor',
+          isDraft: true,
+          singleValueExtendedProperties: [{
+            id: trackingProperty,
+            value: 'track-1000',
+          }],
+        }],
+      }),
+    }));
+    await expect(provider.findDraftByTrackingId('track-100')).resolves.toBeNull();
+  });
+
+  it('findDraftByTrackingId fails closed when two drafts share the id', async () => {
+    const provider = new GraphEmailProvider(createMockClient({
+      get: vi.fn().mockResolvedValue({
+        value: [
+          {
+            id: 'draft-a',
+            isDraft: true,
+            singleValueExtendedProperties: [{ id: trackingProperty, value: 'dup-id' }],
+          },
+          {
+            id: 'draft-b',
+            isDraft: true,
+            singleValueExtendedProperties: [{ id: trackingProperty, value: 'dup-id' }],
+          },
+        ],
+      }),
+    }));
+    await expect(provider.findDraftByTrackingId('dup-id'))
+      .rejects.toMatchObject({ code: 'TRACKING_ID_AMBIGUOUS' });
   });
 });
 

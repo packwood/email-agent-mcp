@@ -610,6 +610,80 @@ describe('provider-gmail/Draft Operations', () => {
     expect(client.createDraft).toHaveBeenCalledWith(expect.any(String), undefined);
     const raw = lastRaw(client.createDraft as ReturnType<typeof vi.fn>);
     expect(raw).toContain('X-Agent-Draft-Origin: non_reply');
+    expect(raw).not.toContain('X-Agent-Email-Tracking-Id:');
+  });
+
+  it('createDraft writes X-Agent-Email-Tracking-Id when trackingId is supplied', async () => {
+    const client = createMockGmailClient();
+    const provider = new GmailEmailProvider(client);
+
+    await provider.createDraft({
+      to: [{ email: 'bob@corp.com' }],
+      subject: 'Tracked',
+      body: 'Hello',
+      trackingId: 'create-timeout-1',
+    });
+
+    const raw = lastRaw(client.createDraft as ReturnType<typeof vi.fn>);
+    expect(raw).toContain('X-Agent-Email-Tracking-Id: create-timeout-1');
+  });
+
+  it('findDraftByTrackingId returns only an exact header match', async () => {
+    const client = createMockGmailClient({
+      listDrafts: vi.fn().mockResolvedValue({
+        drafts: [
+          { id: 'draft-prefix', message: { id: 'msg-prefix', threadId: 't-1' } },
+          { id: 'draft-exact', message: { id: 'msg-exact', threadId: 't-2' } },
+        ],
+      }),
+      getDraft: vi.fn(async (id: string) => {
+        if (id === 'draft-exact') {
+          return {
+            id: 'draft-exact',
+            message: {
+              id: 'msg-exact',
+              threadId: 't-2',
+              labelIds: ['DRAFT'],
+              payload: {
+                headers: [
+                  { name: 'X-Agent-Email-Tracking-Id', value: 'track-100' },
+                  { name: 'Subject', value: 'Exact' },
+                ],
+              },
+            },
+          };
+        }
+        return {
+          id: 'draft-prefix',
+          message: {
+            id: 'msg-prefix',
+            threadId: 't-1',
+            labelIds: ['DRAFT'],
+            payload: {
+              headers: [
+                { name: 'X-Agent-Email-Tracking-Id', value: 'track-1000' },
+                { name: 'Subject', value: 'Neighbor' },
+              ],
+            },
+          },
+        };
+      }),
+    });
+    const provider = new GmailEmailProvider(client);
+
+    await expect(provider.findDraftByTrackingId('track-100')).resolves.toEqual({
+      draftId: 'draft-exact',
+      messageId: 'msg-exact',
+    });
+    await expect(provider.findDraftByTrackingId('track-10')).resolves.toBeNull();
+  });
+
+  it('findDraftByTrackingId fails closed without drafts.list', async () => {
+    const client = createMockGmailClient();
+    delete (client as { listDrafts?: unknown }).listDrafts;
+    const provider = new GmailEmailProvider(client);
+    await expect(provider.findDraftByTrackingId('any-id'))
+      .rejects.toMatchObject({ code: 'NOT_SUPPORTED' });
   });
 
   it('Scenario: sendDraft calls Gmail API with draft ID', async () => {
@@ -1094,6 +1168,20 @@ describe('provider-gmail/Reply Drafts', () => {
     // References appends the original's Message-ID to its existing list.
     expect(raw).toContain('References: <msg-r1@corp.com> <msg-a@corp.com>');
     expect(raw).toContain('Thanks for the update.');
+  });
+
+  it('createReplyDraft writes X-Agent-Email-Tracking-Id when trackingId is supplied', async () => {
+    const client = createMockGmailClient({
+      getMessage: vi.fn().mockResolvedValue(originalMessageMock()),
+    });
+    const provider = new GmailEmailProvider(client);
+
+    await provider.createReplyDraft('msg-original', 'Thanks', {
+      trackingId: 'reply-timeout-1',
+    });
+
+    const raw = lastRaw(client.createDraft as ReturnType<typeof vi.fn>);
+    expect(raw).toContain('X-Agent-Email-Tracking-Id: reply-timeout-1');
   });
 
   it('Scenario: subject prefixed with Re: is not double-prefixed', async () => {
