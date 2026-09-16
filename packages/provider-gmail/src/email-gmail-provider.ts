@@ -21,13 +21,20 @@ import { AttachmentNotFoundError } from '@usejunior/email-core';
 const FOLDER_TO_LABEL: Record<string, string> = {
   inbox: 'INBOX',
   sent: 'SENT',
+  sentitems: 'SENT',
   trash: 'TRASH',
+  deleted: 'TRASH',
+  deleteditems: 'TRASH',
   junk: 'SPAM',
   spam: 'SPAM',
+  junkemail: 'SPAM',
   drafts: 'DRAFT',
   starred: 'STARRED',
   important: 'IMPORTANT',
 };
+
+const LOCATION_LABELS = new Set(['INBOX', 'TRASH', 'SPAM', 'DRAFT', 'SENT']);
+const ARCHIVE_SENTINEL = '__ARCHIVE__';
 
 // Matches Microsoft's SUBJECT_MAX_LENGTH — keeps cross-provider behaviour consistent.
 const SUBJECT_MAX_LENGTH = 255;
@@ -461,6 +468,38 @@ export class GmailEmailProvider {
         },
       };
     }
+  }
+
+  async moveToFolder(messageId: string, folder: string): Promise<string> {
+    const destination = resolveMoveLabel(folder);
+    const message = await this.client.getMessage(messageId);
+    const current = new Set(message.labelIds ?? []);
+    const addLabelIds: string[] = [];
+    const removeLabelIds: string[] = [];
+
+    if (destination === ARCHIVE_SENTINEL) {
+      if (current.has('INBOX')) removeLabelIds.push('INBOX');
+    } else if (LOCATION_LABELS.has(destination)) {
+      if (!current.has(destination)) addLabelIds.push(destination);
+      for (const label of LOCATION_LABELS) {
+        if (label !== destination && current.has(label)) removeLabelIds.push(label);
+      }
+    } else {
+      if (!current.has(destination)) addLabelIds.push(destination);
+      if (current.has('INBOX')) removeLabelIds.push('INBOX');
+    }
+
+    if (addLabelIds.length > 0 || removeLabelIds.length > 0) {
+      await this.client.modifyMessage(messageId, { addLabelIds, removeLabelIds });
+    }
+    return messageId;
+  }
+
+  async deleteMessage(messageId: string, _hard = false): Promise<void> {
+    // Gmail has no recoverable-equivalent of Graph permanentDelete. Always apply
+    // the TRASH label and never call messages.delete, including when the caller
+    // asked for a hard delete.
+    await this.moveToFolder(messageId, 'trash');
   }
 
   async getDraftReplyStatus(draftId: string): Promise<DraftReplyStatus> {
@@ -973,6 +1012,12 @@ function mergeAddressLists(
  * Add a `Re: ` prefix to a subject unless one already exists. Case-insensitive
  * match — `RE:`, `re:`, and `Re:` all count as already prefixed.
  */
+function resolveMoveLabel(folder: string): string {
+  const key = folder.trim().toLowerCase();
+  if (key === 'archive' || key === 'archived') return ARCHIVE_SENTINEL;
+  return FOLDER_TO_LABEL[key] ?? folder;
+}
+
 function prefixReSubject(subject: string): string {
   if (/^re:\s*/i.test(subject)) return subject;
   return `Re: ${subject}`;

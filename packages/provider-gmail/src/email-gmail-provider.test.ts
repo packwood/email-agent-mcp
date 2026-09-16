@@ -3,7 +3,9 @@ import { GmailEmailProvider, type GmailApiClient } from './email-gmail-provider.
 import {
   AttachmentNotFoundError,
   cancelScheduledSendAction,
+  deleteEmailAction,
   listScheduledSendsAction,
+  moveToFolderAction,
   sendDraftAction,
   sendEmailAction,
   type EmailScheduledSender,
@@ -367,6 +369,137 @@ describe('provider-gmail/Label Mapping', () => {
     expect(client.listMessages).toHaveBeenCalledWith(
       expect.objectContaining({ labelIds: ['SPAM'] }),
     );
+  });
+});
+
+describe('provider-gmail/Move and Trash', () => {
+  function labeledMessage(labelIds: string[]) {
+    return {
+      id: 'msg-1',
+      threadId: 'thread-1',
+      labelIds,
+      payload: {
+        headers: [
+          { name: 'From', value: 'alice@corp.com' },
+          { name: 'To', value: 'bob@corp.com' },
+          { name: 'Subject', value: 'Move me' },
+        ],
+      },
+      internalDate: String(Date.now()),
+    };
+  }
+
+  it('Scenario: moveToFolder maps inbox to archive by removing INBOX', async () => {
+    const client = createMockGmailClient({
+      getMessage: vi.fn().mockResolvedValue(labeledMessage(['INBOX', 'UNREAD'])),
+    });
+    const provider = new GmailEmailProvider(client);
+
+    const newId = await provider.moveToFolder('msg-1', 'archive');
+
+    expect(newId).toBe('msg-1');
+    expect(client.modifyMessage).toHaveBeenCalledWith('msg-1', {
+      addLabelIds: [],
+      removeLabelIds: ['INBOX'],
+    });
+  });
+
+  it('Scenario: moveToFolder maps trash via the well-known TRASH label', async () => {
+    const client = createMockGmailClient({
+      getMessage: vi.fn().mockResolvedValue(labeledMessage(['INBOX'])),
+    });
+    const provider = new GmailEmailProvider(client);
+
+    await provider.moveToFolder('msg-1', 'trash');
+
+    expect(client.modifyMessage).toHaveBeenCalledWith('msg-1', {
+      addLabelIds: ['TRASH'],
+      removeLabelIds: ['INBOX'],
+    });
+  });
+
+  it('Scenario: moveToFolder accepts Graph-style deleteditems alias', async () => {
+    const client = createMockGmailClient({
+      getMessage: vi.fn().mockResolvedValue(labeledMessage(['INBOX'])),
+    });
+    const provider = new GmailEmailProvider(client);
+
+    await provider.moveToFolder('msg-1', 'deleteditems');
+
+    expect(client.modifyMessage).toHaveBeenCalledWith('msg-1', {
+      addLabelIds: ['TRASH'],
+      removeLabelIds: ['INBOX'],
+    });
+  });
+
+  it('Scenario: moveToFolder to a custom label removes INBOX', async () => {
+    const client = createMockGmailClient({
+      getMessage: vi.fn().mockResolvedValue(labeledMessage(['INBOX'])),
+    });
+    const provider = new GmailEmailProvider(client);
+
+    await provider.moveToFolder('msg-1', 'Label_42');
+
+    expect(client.modifyMessage).toHaveBeenCalledWith('msg-1', {
+      addLabelIds: ['Label_42'],
+      removeLabelIds: ['INBOX'],
+    });
+  });
+
+  it('Scenario: deleteMessage applies TRASH and never calls messages.delete', async () => {
+    const client = createMockGmailClient({
+      getMessage: vi.fn().mockResolvedValue(labeledMessage(['INBOX'])),
+    });
+    const provider = new GmailEmailProvider(client);
+
+    await provider.deleteMessage('msg-1');
+    await provider.deleteMessage('msg-1', true);
+
+    expect(client.modifyMessage).toHaveBeenCalledTimes(2);
+    expect(client.modifyMessage).toHaveBeenNthCalledWith(1, 'msg-1', {
+      addLabelIds: ['TRASH'],
+      removeLabelIds: ['INBOX'],
+    });
+    expect(client.modifyMessage).toHaveBeenNthCalledWith(2, 'msg-1', {
+      addLabelIds: ['TRASH'],
+      removeLabelIds: ['INBOX'],
+    });
+    expect(client).not.toHaveProperty('deleteMessage');
+    expect(Object.keys(client)).not.toContain('delete');
+  });
+
+  it('Scenario: move_to_folder action succeeds on Gmail', async () => {
+    const client = createMockGmailClient({
+      getMessage: vi.fn().mockResolvedValue(labeledMessage(['INBOX'])),
+    });
+    const provider = new GmailEmailProvider(client);
+
+    const result = await moveToFolderAction.run({ provider }, { id: 'msg-1', folder: 'junk' });
+
+    expect(result.success).toBe(true);
+    expect(result.newId).toBe('msg-1');
+    expect(client.modifyMessage).toHaveBeenCalledWith('msg-1', {
+      addLabelIds: ['SPAM'],
+      removeLabelIds: ['INBOX'],
+    });
+  });
+
+  it('Scenario: delete_email soft-delete on Gmail uses TRASH', async () => {
+    const client = createMockGmailClient({
+      getMessage: vi.fn().mockResolvedValue(labeledMessage(['INBOX'])),
+    });
+    const provider = new GmailEmailProvider(client);
+
+    const result = await deleteEmailAction.run(
+      { provider, deleteEnabled: true, hardDeleteAllowed: false },
+      { id: 'msg-1', user_explicitly_requested_deletion: true, hard_delete: false },
+    );
+
+    expect(result.success).toBe(true);
+    expect(client.modifyMessage).toHaveBeenCalledWith('msg-1', {
+      addLabelIds: ['TRASH'],
+      removeLabelIds: ['INBOX'],
+    });
   });
 });
 
