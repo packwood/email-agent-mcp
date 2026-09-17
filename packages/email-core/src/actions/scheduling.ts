@@ -63,7 +63,7 @@ export const cancelScheduledSendAction: EmailAction<
   z.infer<typeof CancelScheduledSendOutput>
 > = {
   name: 'cancel_scheduled_send',
-  description: 'Cancel a pending provider-held scheduled send. Only verified scheduled drafts can be cancelled.',
+  description: 'Cancel a pending provider-held scheduled send. Only verified scheduled drafts can be cancelled. On Outlook this destroys the scheduled draft: it is not parked in Deleted Items and cannot be recovered, so capture anything you need from it before cancelling.',
   input: CancelScheduledSendInput,
   output: CancelScheduledSendOutput,
   annotations: { readOnlyHint: false, destructiveHint: true },

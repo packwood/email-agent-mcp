@@ -229,6 +229,72 @@ describe('email-write/Message ID Validation', () => {
     expect(result.success).toBe(false);
     expect(result.error!.code).toBe('INVALID_MESSAGE_ID');
   });
+
+  it('reply draft accepts bcc and bypasses the allowlist', async () => {
+    const result = await replyToEmailAction.run(ctx, {
+      message_id: VALID_MSG_ID,
+      body: 'Thanks',
+      draft: true,
+      bcc: ['"Counsel" <counsel@outside.com>'],
+    });
+    expect(result.success).toBe(true);
+    const draft = [...provider.getDrafts().values()][0]!;
+    expect(draft.bcc).toEqual([{ name: 'Counsel', email: 'counsel@outside.com' }]);
+    expect(provider.getSentMessages()).toHaveLength(0);
+  });
+
+  it('reply send path gates bcc against the allowlist', async () => {
+    const result = await replyToEmailAction.run(ctx, {
+      message_id: VALID_MSG_ID,
+      body: 'Thanks',
+      bcc: ['secret@blocked.com'],
+    });
+    expect(result.success).toBe(false);
+    expect(result.error?.code).toBe('ALLOWLIST_BLOCKED');
+    expect(provider.getSentMessages()).toHaveLength(0);
+  });
+
+  it('reply send path includes an allowed bcc', async () => {
+    const result = await replyToEmailAction.run(ctx, {
+      message_id: VALID_MSG_ID,
+      body: 'Thanks',
+      bcc: ['audit@lawfirm.com'],
+    });
+    expect(result.success).toBe(true);
+    expect(provider.getSentMessages()[0]!.bcc).toEqual([{ email: 'audit@lawfirm.com' }]);
+  });
+
+  it('reply draft threads tracking_id onto the persisted draft', async () => {
+    const result = await replyToEmailAction.run(ctx, {
+      message_id: VALID_MSG_ID,
+      body: 'Thanks',
+      draft: true,
+      tracking_id: 'reply-timeout-1',
+    });
+    expect(result.success).toBe(true);
+    expect([...provider.getDrafts().values()][0]!.trackingId).toBe('reply-timeout-1');
+  });
+
+  it('reply send path threads tracking_id onto the composed message', async () => {
+    const result = await replyToEmailAction.run(ctx, {
+      message_id: VALID_MSG_ID,
+      body: 'Thanks',
+      tracking_id: 'reply-send-1',
+    });
+    expect(result.success).toBe(true);
+    expect(provider.getSentMessages()[0]!.trackingId).toBe('reply-send-1');
+  });
+
+  it('reply rejects a tracking_id that cannot be matched exactly', async () => {
+    const result = await replyToEmailAction.run(ctx, {
+      message_id: VALID_MSG_ID,
+      body: 'Thanks',
+      tracking_id: 'bad id\n',
+    });
+    expect(result.success).toBe(false);
+    expect(result.error?.code).toBe('INVALID_TRACKING_ID');
+    expect(provider.getSentMessages()).toHaveLength(0);
+  });
 });
 
 describe('email-write/Body Rendering', () => {

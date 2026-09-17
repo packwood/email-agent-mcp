@@ -3,14 +3,17 @@ import type {
   EmailMessage,
   EmailThread,
   ComposeMessage,
+  OutboundAttachment,
   SendResult,
   DraftResult,
   ListOptions,
   ReplyOptions,
+  ForwardOptions,
   Subscription,
   EmailAttachment,
   ScheduledSend,
   ScheduledSendResult,
+  DraftLookupResult,
 } from '../types.js';
 import {
   ProviderError,
@@ -133,11 +136,34 @@ export class MockEmailProvider implements EmailReader, EmailSender, EmailSchedul
         isRead: true,
         hasAttachments: (attachments?.length ?? 0) > 0,
         body: draft.body,
+        bodyHtml: draft.bodyHtml,
         attachments,
+        threadId: draft.threadId,
+        conversationId: draft.threadId,
       };
     }
 
     throw new Error(`Message not found: ${id}`);
+  }
+
+  async findDraftByTrackingId(trackingId: string): Promise<DraftLookupResult | null> {
+    this.maybeThrow();
+    const matches: DraftLookupResult[] = [];
+    for (const [draftId, draft] of this.drafts) {
+      if (draft.trackingId === trackingId) {
+        matches.push({ draftId, messageId: draftId });
+      }
+    }
+    if (matches.length === 0) return null;
+    if (matches.length > 1) {
+      throw new ProviderError(
+        'TRACKING_ID_AMBIGUOUS',
+        `Multiple drafts share tracking_id ${trackingId}`,
+        'mock',
+        false,
+      );
+    }
+    return matches[0]!;
   }
 
   async searchMessages(query: string, _folder?: string, limit?: number, offset?: number): Promise<EmailMessage[]> {
@@ -243,6 +269,7 @@ export class MockEmailProvider implements EmailReader, EmailSender, EmailSchedul
       body,
       bodyHtml: opts?.bodyHtml,
       attachments: opts?.attachments,
+      trackingId: opts?.trackingId,
     });
 
     return { success: true, messageId: id };
@@ -330,10 +357,35 @@ export class MockEmailProvider implements EmailReader, EmailSender, EmailSchedul
     this.drafts.set(draftId, {
       to: [original.from],
       cc: opts?.cc,
+      bcc: opts?.bcc,
       subject: `Re: ${original.subject}`,
       body,
       bodyHtml: opts?.bodyHtml,
       attachments: opts?.attachments,
+      trackingId: opts?.trackingId,
+    });
+    this.replyDraftIds.add(draftId);
+    return { success: true, draftId };
+  }
+
+  async createForwardDraft(messageId: string, opts: ForwardOptions): Promise<DraftResult> {
+    this.maybeThrow();
+    const original = this.messages.find(m => m.id === messageId);
+    if (!original) {
+      throw new Error(`Message not found: ${messageId}`);
+    }
+    const draftId = `draft-${this.nextId++}`;
+    const subject = /^fwd:\s*/i.test(original.subject) || /^fw:\s*/i.test(original.subject)
+      ? original.subject
+      : `Fwd: ${original.subject}`;
+    this.drafts.set(draftId, {
+      to: opts.to,
+      cc: opts.cc,
+      subject,
+      body: opts.comment ?? '',
+      bodyHtml: opts.bodyHtml,
+      attachments: opts.attachments,
+      threadId: original.threadId ?? original.conversationId,
     });
     this.replyDraftIds.add(draftId);
     return { success: true, draftId };
@@ -357,12 +409,65 @@ export class MockEmailProvider implements EmailReader, EmailSender, EmailSchedul
       ...existing,
       ...(msg.to !== undefined && { to: msg.to }),
       ...(msg.cc !== undefined && { cc: msg.cc }),
+      ...(msg.bcc !== undefined && { bcc: msg.bcc }),
       ...(msg.subject !== undefined && { subject: msg.subject }),
       ...(msg.body !== undefined && { body: msg.body }),
       ...(msg.bodyHtml !== undefined && { bodyHtml: msg.bodyHtml }),
       // Omitted attachments → preserve via the `...existing` spread;
       // provided (even []) → replace.
       ...(msg.attachments !== undefined && { attachments: msg.attachments }),
+    });
+    return { success: true, draftId };
+  }
+
+  async addDraftAttachments(draftId: string, attachments: OutboundAttachment[]): Promise<DraftResult> {
+    this.maybeThrow();
+    const existing = this.drafts.get(draftId);
+    if (!existing) {
+      return {
+        success: false,
+        error: { code: 'DRAFT_NOT_FOUND', message: `Draft not found: ${draftId}`, recoverable: false },
+      };
+    }
+    this.drafts.set(draftId, {
+      ...existing,
+      attachments: [...(existing.attachments ?? []), ...attachments],
+    });
+    return { success: true, draftId };
+  }
+
+  async removeDraftAttachments(draftId: string, attachmentIds: string[]): Promise<DraftResult> {
+    this.maybeThrow();
+    const existing = this.drafts.get(draftId);
+    if (!existing) {
+      return {
+        success: false,
+        error: { code: 'DRAFT_NOT_FOUND', message: `Draft not found: ${draftId}`, recoverable: false },
+      };
+    }
+    const current = (existing.attachments ?? []).map((attachment, index) => ({
+      ...attachment,
+      id: `${draftId}-att-${index}`,
+    }));
+    const named = [...new Set(attachmentIds)];
+    const missing = named.filter(id => !current.some(attachment => attachment.id === id));
+    if (missing.length > 0) {
+      return {
+        success: false,
+        draftId,
+        error: {
+          code: 'ATTACHMENT_NOT_FOUND',
+          message: `Attachment not found on draft ${draftId}: ${missing.join(', ')}`,
+          recoverable: false,
+        },
+      };
+    }
+    const namedSet = new Set(named);
+    this.drafts.set(draftId, {
+      ...existing,
+      attachments: current
+        .filter(attachment => !namedSet.has(attachment.id))
+        .map(({ filename, content, mimeType }) => ({ filename, content, mimeType })),
     });
     return { success: true, draftId };
   }

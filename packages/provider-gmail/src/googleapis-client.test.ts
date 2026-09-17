@@ -29,6 +29,7 @@ function createMockApi() {
         modify: vi.fn().mockResolvedValue({}),
       },
       drafts: {
+        list: vi.fn().mockResolvedValue({ data: { drafts: [{ id: 'd-1', message: { id: 'm-draft', threadId: 't-draft' } }] } }),
         create: vi.fn().mockResolvedValue({ data: { id: 'd-1', message: { id: 'm-draft', threadId: 't-draft' } } }),
         get: vi.fn().mockResolvedValue({ data: { id: 'd-1', message: message('m-draft', 't-draft') } }),
         send: vi.fn().mockResolvedValue({ data: { id: 'm-sent-draft', threadId: 't-draft' } }),
@@ -107,6 +108,22 @@ describe('provider-gmail/GoogleapisGmailClient', () => {
     });
     expect(result.id).toBe('m-1');
     expect(result.threadId).toBe('t-1');
+  });
+
+  it('Scenario: listDrafts forwards Gmail drafts.list request shape', async () => {
+    const api = createMockApi();
+    const client = createClient(api);
+
+    const result = await client.listDrafts({ maxResults: 50, pageToken: 'page-2' });
+
+    expect(api.users.drafts.list).toHaveBeenCalledWith({
+      userId: 'me',
+      maxResults: 50,
+      pageToken: 'page-2',
+    });
+    expect(result).toEqual({
+      drafts: [{ id: 'd-1', message: { id: 'm-draft', threadId: 't-draft' } }],
+    });
   });
 
   it('Scenario: getDraft requests the draft resource and returns its backing message', async () => {

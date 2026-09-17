@@ -10,27 +10,37 @@ import type {
   DraftResult,
   ListOptions,
   ReplyOptions,
+  ForwardOptions,
   DownloadedAttachment,
   OutboundAttachment,
   DraftReplyStatus,
+  DraftLookupResult,
 } from '@usejunior/email-core';
-import { AttachmentNotFoundError } from '@usejunior/email-core';
+import { AttachmentNotFoundError, ProviderError } from '@usejunior/email-core';
 
 // Gmail label mapping
 const FOLDER_TO_LABEL: Record<string, string> = {
   inbox: 'INBOX',
   sent: 'SENT',
+  sentitems: 'SENT',
   trash: 'TRASH',
+  deleted: 'TRASH',
+  deleteditems: 'TRASH',
   junk: 'SPAM',
   spam: 'SPAM',
+  junkemail: 'SPAM',
   drafts: 'DRAFT',
   starred: 'STARRED',
   important: 'IMPORTANT',
 };
 
+const LOCATION_LABELS = new Set(['INBOX', 'TRASH', 'SPAM', 'DRAFT', 'SENT']);
+const ARCHIVE_SENTINEL = '__ARCHIVE__';
+
 // Matches Microsoft's SUBJECT_MAX_LENGTH — keeps cross-provider behaviour consistent.
 const SUBJECT_MAX_LENGTH = 255;
 const DRAFT_ORIGIN_HEADER = 'X-Agent-Draft-Origin';
+const TRACKING_HEADER = 'X-Agent-Email-Tracking-Id';
 type DraftOrigin = 'reply' | 'non_reply';
 
 export interface GmailApiClient {
@@ -60,6 +70,15 @@ export interface GmailApiClient {
    * falls back to a structured NOT_SUPPORTED error when this is missing.
    */
   updateDraft?(draftId: string, raw: string, threadId?: string): Promise<{ id: string; message: { id: string; threadId: string } }>;
+  /**
+   * List draft resources (draft id + backing message id). Optional so older
+   * concrete clients keep type-checking; findDraftByTrackingId fails closed
+   * with NOT_SUPPORTED when this is missing.
+   */
+  listDrafts?(opts?: { maxResults?: number; pageToken?: string }): Promise<{
+    drafts?: Array<{ id: string; message?: { id: string; threadId: string } }>;
+    nextPageToken?: string;
+  }>;
 }
 
 interface GmailMessagePart {
@@ -260,6 +279,7 @@ export class GmailEmailProvider {
         body,
         bodyHtml: opts?.bodyHtml,
         attachments: opts?.attachments,
+        trackingId: opts?.trackingId,
       },
       {
         inReplyTo: original.messageId,
@@ -300,6 +320,7 @@ export class GmailEmailProvider {
           body,
           bodyHtml: opts?.bodyHtml,
           attachments: opts?.attachments,
+          trackingId: opts?.trackingId,
         },
         {
           inReplyTo: original.messageId,
@@ -320,6 +341,60 @@ export class GmailEmailProvider {
         },
       };
     }
+  }
+
+  async createForwardDraft(messageId: string, opts: ForwardOptions): Promise<DraftResult> {
+    try {
+      const original = await this.getMessage(messageId);
+      const forwardedAttachments = await this.collectForwardedAttachments(original);
+      const extra = opts.attachments ?? [];
+      const attachments = forwardedAttachments.length + extra.length > 0
+        ? [...forwardedAttachments, ...extra]
+        : undefined;
+      const quoted = formatForwardedBodies(original, opts.comment ?? '', opts.bodyHtml);
+      const references = buildReferences(original.references, original.messageId);
+
+      const raw = buildRawMessage(
+        {
+          to: opts.to,
+          cc: opts.cc,
+          subject: prefixFwdSubject(original.subject),
+          body: quoted.body,
+          bodyHtml: quoted.bodyHtml,
+          attachments,
+        },
+        {
+          inReplyTo: original.messageId,
+          references,
+          draftOrigin: 'reply',
+        },
+      );
+
+      const result = await this.client.createDraft(raw, original.threadId);
+      return { success: true, draftId: result.id };
+    } catch (err) {
+      return {
+        success: false,
+        error: {
+          code: 'DRAFT_FAILED',
+          message: err instanceof Error ? err.message : String(err),
+          recoverable: false,
+        },
+      };
+    }
+  }
+
+  private async collectForwardedAttachments(original: EmailMessage): Promise<OutboundAttachment[]> {
+    const attachments: OutboundAttachment[] = [];
+    for (const att of original.attachments ?? []) {
+      const downloaded = await this.downloadAttachment(original.id, att.id);
+      attachments.push({
+        filename: downloaded.filename,
+        content: downloaded.content,
+        mimeType: downloaded.mimeType,
+      });
+    }
+    return attachments;
   }
 
   async updateDraft(draftId: string, msg: Partial<ComposeMessage>): Promise<DraftResult> {
@@ -386,6 +461,7 @@ export class GmailEmailProvider {
         body: msg.body ?? current.body ?? '',
         bodyHtml: msg.bodyHtml ?? current.bodyHtml,
         attachments,
+        trackingId: msg.trackingId ?? getHeader(draftResource.message, TRACKING_HEADER),
       };
 
       const raw = buildRawMessage(merged, {
@@ -406,6 +482,83 @@ export class GmailEmailProvider {
         },
       };
     }
+  }
+
+  async moveToFolder(messageId: string, folder: string): Promise<string> {
+    const destination = resolveMoveLabel(folder);
+    const message = await this.client.getMessage(messageId);
+    const current = new Set(message.labelIds ?? []);
+    const addLabelIds: string[] = [];
+    const removeLabelIds: string[] = [];
+
+    if (destination === ARCHIVE_SENTINEL) {
+      if (current.has('INBOX')) removeLabelIds.push('INBOX');
+    } else if (LOCATION_LABELS.has(destination)) {
+      if (!current.has(destination)) addLabelIds.push(destination);
+      for (const label of LOCATION_LABELS) {
+        if (label !== destination && current.has(label)) removeLabelIds.push(label);
+      }
+    } else {
+      if (!current.has(destination)) addLabelIds.push(destination);
+      if (current.has('INBOX')) removeLabelIds.push('INBOX');
+    }
+
+    if (addLabelIds.length > 0 || removeLabelIds.length > 0) {
+      await this.client.modifyMessage(messageId, { addLabelIds, removeLabelIds });
+    }
+    return messageId;
+  }
+
+  async deleteMessage(messageId: string, _hard = false): Promise<void> {
+    // Gmail has no recoverable-equivalent of Graph permanentDelete. Always apply
+    // the TRASH label and never call messages.delete, including when the caller
+    // asked for a hard delete.
+    await this.moveToFolder(messageId, 'trash');
+  }
+
+  async findDraftByTrackingId(trackingId: string): Promise<DraftLookupResult | null> {
+    if (!this.client.listDrafts) {
+      throw new ProviderError(
+        'NOT_SUPPORTED',
+        'Finding a draft by tracking_id requires Gmail drafts.list',
+        'gmail',
+        false,
+      );
+    }
+
+    const matches: DraftLookupResult[] = [];
+    const visitedTokens = new Set<string>();
+    let pageToken: string | undefined;
+    for (let pages = 0; pages < 100; pages++) {
+      const page = await this.client.listDrafts({
+        maxResults: 100,
+        ...(pageToken ? { pageToken } : {}),
+      });
+      for (const stub of page.drafts ?? []) {
+        if (!stub.id) continue;
+        const draft = await this.client.getDraft(stub.id);
+        const values = getHeaders(draft.message, TRACKING_HEADER);
+        if (values.length > 0 && values.every(value => value === trackingId)) {
+          matches.push({ draftId: draft.id, messageId: draft.message.id });
+        }
+      }
+      const next = page.nextPageToken;
+      if (!next) break;
+      if (visitedTokens.has(next)) throw new Error('Gmail draft pagination did not terminate');
+      visitedTokens.add(next);
+      pageToken = next;
+    }
+
+    if (matches.length === 0) return null;
+    if (matches.length > 1) {
+      throw new ProviderError(
+        'TRACKING_ID_AMBIGUOUS',
+        `Multiple drafts share tracking_id ${trackingId}`,
+        'gmail',
+        false,
+      );
+    }
+    return matches[0]!;
   }
 
   async getDraftReplyStatus(draftId: string): Promise<DraftReplyStatus> {
@@ -855,6 +1008,7 @@ function buildRawMessage(msg: ComposeMessage, opts: BuildRawOptions = {}): strin
   if (msg.bcc && msg.bcc.length > 0) headers.push(`Bcc: ${formatAddressList(msg.bcc)}`);
   headers.push(`Subject: ${escapeHeader(msg.subject)}`);
   if (opts.draftOrigin) headers.push(`${DRAFT_ORIGIN_HEADER}: ${opts.draftOrigin}`);
+  if (msg.trackingId) headers.push(`${TRACKING_HEADER}: ${escapeHeader(msg.trackingId)}`);
   if (opts.inReplyTo) headers.push(`In-Reply-To: ${escapeHeader(opts.inReplyTo)}`);
   if (opts.references && opts.references.length > 0) {
     headers.push(`References: ${opts.references.map(r => r.replace(/[\r\n]+/g, '')).join(' ')}`);
@@ -918,9 +1072,70 @@ function mergeAddressLists(
  * Add a `Re: ` prefix to a subject unless one already exists. Case-insensitive
  * match — `RE:`, `re:`, and `Re:` all count as already prefixed.
  */
+function resolveMoveLabel(folder: string): string {
+  const key = folder.trim().toLowerCase();
+  if (key === 'archive' || key === 'archived') return ARCHIVE_SENTINEL;
+  return FOLDER_TO_LABEL[key] ?? folder;
+}
+
 function prefixReSubject(subject: string): string {
   if (/^re:\s*/i.test(subject)) return subject;
   return `Re: ${subject}`;
+}
+
+function prefixFwdSubject(subject: string): string {
+  if (/^fwd:\s*/i.test(subject) || /^fw:\s*/i.test(subject)) return subject;
+  return `Fwd: ${subject}`;
+}
+
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+function formatAddressLine(addr: EmailAddress): string {
+  return addr.name ? `${addr.name} <${addr.email}>` : addr.email;
+}
+
+function formatForwardedBodies(
+  original: EmailMessage,
+  commentPlain: string,
+  commentHtml: string | undefined,
+): { body: string; bodyHtml?: string } {
+  const fromLine = formatAddressLine(original.from);
+  const toLine = original.to.map(formatAddressLine).join(', ');
+  const dateLine = original.receivedAt;
+  const headerBlock = [
+    '---------- Forwarded message ---------',
+    `From: ${fromLine}`,
+    `Date: ${dateLine}`,
+    `Subject: ${original.subject}`,
+    `To: ${toLine}`,
+  ].join('\n');
+  const originalPlain = original.body ?? '';
+  const body = [commentPlain, '', headerBlock, '', originalPlain].join('\n');
+
+  if (commentHtml === undefined && original.bodyHtml === undefined) {
+    return { body };
+  }
+
+  const commentFragment = commentHtml !== undefined
+    ? commentHtml
+    : (commentPlain ? `<div>${escapeHtml(commentPlain).replace(/\n/g, '<br>')}</div>` : '');
+  const quotedHtml = original.bodyHtml
+    ?? `<pre>${escapeHtml(originalPlain)}</pre>`;
+  const bodyHtml = `${commentFragment}`
+    + '<div>---------- Forwarded message ---------<br>'
+    + `<b>From:</b> ${escapeHtml(fromLine)}<br>`
+    + `<b>Date:</b> ${escapeHtml(dateLine)}<br>`
+    + `<b>Subject:</b> ${escapeHtml(original.subject)}<br>`
+    + `<b>To:</b> ${escapeHtml(toLine)}<br>`
+    + '<br></div>'
+    + quotedHtml;
+  return { body, bodyHtml };
 }
 
 /**

@@ -11,6 +11,7 @@ import {
   checkRateLimit,
   handleProviderError,
   parseRecipients,
+  parseTrackingId,
   buildDraftPreview,
   resolveAttachments,
   AttachmentInputSchema,
@@ -23,6 +24,8 @@ const ReplyToEmailInput = z.object({
   body: z.string(),
   mailbox: z.string().optional(),
   cc: z.array(z.string()).optional(),
+  bcc: z.array(z.string()).optional()
+    .describe('Bcc recipients. Parsed with the same name-address grammar as to/cc. Draft replies bypass the send allowlist; the send path gates every effective To/Cc/Bcc address.'),
   draft: z.boolean().optional(),
   include_quoted: z.boolean().optional().default(false)
     .describe('Include provider-assembled quoted history in preview.bodyHtml for draft replies. This affects only the preview, never the stored or sent body.'),
@@ -34,6 +37,8 @@ const ReplyToEmailInput = z.object({
     .describe('Wrap rendered HTML in a force-black div so Outlook dark mode does not hide the text. Default true.'),
   attachments: z.array(AttachmentInputSchema).optional()
     .describe('Files to attach. Each entry takes a sandboxed `path` or inline `base64`.'),
+  tracking_id: z.string().optional()
+    .describe('Caller-supplied exact tracking id written onto the reply/draft so a timed-out create can be reconciled instead of retried. Lookup is exact, never fuzzy.'),
 });
 
 const ReplyToEmailOutput = z.object({
@@ -78,6 +83,7 @@ function collectReplyAllowlistRecipients(
   ctx: ActionContext,
   originalMessage: EmailMessage,
   parsedCc: EmailAddress[],
+  parsedBcc: EmailAddress[],
   replyAll: boolean,
 ): string[] {
   const currentMailboxEmails = collectCurrentMailboxEmails(ctx);
@@ -105,6 +111,10 @@ function collectReplyAllowlistRecipients(
   }
 
   for (const recipient of parsedCc) {
+    addRecipient(recipient.email);
+  }
+
+  for (const recipient of parsedBcc) {
     addRecipient(recipient.email);
   }
 
@@ -141,7 +151,7 @@ export const replyToEmailAction: EmailAction<
 
     // Parse cc once — name-address strings ('Jane <jane@x>') become {name, email}.
     // Errors return INVALID_ADDRESS before any provider call or retry logic.
-    const parsed = parseRecipients({ cc: input.cc });
+    const parsed = parseRecipients({ cc: input.cc, bcc: input.bcc });
     if ('error' in parsed) {
       return { success: false, error: parsed.error };
     }
@@ -152,6 +162,11 @@ export const replyToEmailAction: EmailAction<
       return { success: false, error: attResult.error };
     }
     const attachments = attResult.files!.length > 0 ? attResult.files : undefined;
+
+    const tracking = parseTrackingId(input.tracking_id);
+    if ('error' in tracking) {
+      return { success: false, error: tracking.error };
+    }
 
     // Render body: markdown → HTML by default
     const rendered = renderEmailBody(input.body, { format: input.format, forceBlack: input.force_black });
@@ -173,9 +188,11 @@ export const replyToEmailAction: EmailAction<
       try {
         const draftResult = await ctx.provider.createReplyDraft(input.message_id, bodyPlain, {
           cc: parsed.cc,
+          bcc: parsed.bcc.length > 0 ? parsed.bcc : undefined,
           bodyHtml,
           replyAll: input.reply_all,
           attachments,
+          trackingId: tracking.trackingId,
         });
         const previewResult = draftResult.success && draftResult.draftId
           ? await buildDraftPreview(ctx.provider, draftResult.draftId, {
@@ -199,7 +216,13 @@ export const replyToEmailAction: EmailAction<
 
     // Send path — check every effective recipient against the allowlist
     const originalMessage = await ctx.provider.getMessage(input.message_id);
-    const replyRecipients = collectReplyAllowlistRecipients(ctx, originalMessage, parsed.cc, input.reply_all !== false);
+    const replyRecipients = collectReplyAllowlistRecipients(
+      ctx,
+      originalMessage,
+      parsed.cc,
+      parsed.bcc,
+      input.reply_all !== false,
+    );
 
     // Check send allowlist — reply recipients must also be allowed
     const allowlistError = checkSendAllowlist(replyRecipients, ctx.sendAllowlist);
@@ -226,9 +249,11 @@ export const replyToEmailAction: EmailAction<
       const result = await withRetry(
         () => ctx.provider.replyToMessage(input.message_id, bodyPlain, {
           cc: parsed.cc,
+          bcc: parsed.bcc.length > 0 ? parsed.bcc : undefined,
           bodyHtml,
           replyAll: input.reply_all,
           attachments,
+          trackingId: tracking.trackingId,
         }),
         { maxRetries: 3, baseDelay: 1000 },
       );

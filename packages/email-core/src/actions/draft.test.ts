@@ -5,8 +5,11 @@ import { tmpdir } from 'node:os';
 import { createHash } from 'node:crypto';
 import { MockEmailProvider } from '../testing/mock-provider.js';
 import {
+  addDraftAttachmentsAction,
   createDraftAction,
+  findDraftByTrackingIdAction,
   inspectDraftExactAction,
+  removeDraftAttachmentsAction,
   sendDraftAction,
   updateDraftAction,
 } from './draft.js';
@@ -157,6 +160,75 @@ describe('email-write/Inspect Draft Exact', () => {
     await expect(inspectDraftExactAction.run(ctx, {
       draft_id: 'draft-oversized',
     })).rejects.toThrow('Attachment exceeds approval fingerprint limit');
+  });
+
+  it.each(['reply', 'non_reply', 'indeterminate'] as const)(
+    'reports replyStatus %s from the provider',
+    async (status) => {
+      provider.addMessage({
+        id: `draft-status-${status}`,
+        to: [{ email: 'to@example.com' }],
+        subject: 'Status',
+        body: 'plain',
+        from: { email: 'me@example.com' },
+        receivedAt: new Date().toISOString(),
+        isRead: true,
+        hasAttachments: false,
+      });
+      vi.spyOn(provider, 'getDraftReplyStatus').mockResolvedValueOnce(status);
+
+      const result = await inspectDraftExactAction.run(ctx, {
+        draft_id: `draft-status-${status}`,
+      });
+
+      expect(result.replyStatus).toBe(status);
+      expect(result.draftId).toBe(`draft-status-${status}`);
+      expect(result.subject).toBe('Status');
+    },
+  );
+
+  it('sets replyStatus to indeterminate when getDraftReplyStatus throws', async () => {
+    provider.addMessage({
+      id: 'draft-status-throw',
+      to: [{ email: 'to@example.com' }],
+      subject: 'Status',
+      body: 'plain',
+      from: { email: 'me@example.com' },
+      receivedAt: new Date().toISOString(),
+      isRead: true,
+      hasAttachments: false,
+    });
+    vi.spyOn(provider, 'getDraftReplyStatus').mockRejectedValueOnce(new Error('metadata unavailable'));
+
+    const result = await inspectDraftExactAction.run(ctx, {
+      draft_id: 'draft-status-throw',
+    });
+
+    expect(result.replyStatus).toBe('indeterminate');
+    expect(result.draftId).toBe('draft-status-throw');
+    expect(result.subject).toBe('Status');
+  });
+
+  it('omits replyStatus when the provider does not implement getDraftReplyStatus', async () => {
+    provider.addMessage({
+      id: 'draft-status-absent',
+      to: [{ email: 'to@example.com' }],
+      subject: 'Status',
+      body: 'plain',
+      from: { email: 'me@example.com' },
+      receivedAt: new Date().toISOString(),
+      isRead: true,
+      hasAttachments: false,
+    });
+    (provider as Record<string, unknown>).getDraftReplyStatus = undefined;
+
+    const result = await inspectDraftExactAction.run(ctx, {
+      draft_id: 'draft-status-absent',
+    });
+
+    expect(result).not.toHaveProperty('replyStatus');
+    expect(result.draftId).toBe('draft-status-absent');
+    expect(result.subject).toBe('Status');
   });
 });
 
@@ -700,6 +772,44 @@ describe('email-write/Draft Address Parsing', () => {
     expect(draft.cc).toEqual([{ name: 'Bob', email: 'bob@allowed.com' }]);
   });
 
+  it('create_draft parses bcc with the same name-address grammar as to/cc', async () => {
+    const result = await createDraftAction.run(ctx, {
+      to: 'alice@allowed.com',
+      cc: ['Bob <bob@allowed.com>'],
+      bcc: ['"Carol Jones" <carol@hidden.com>'],
+      subject: 'Quiet copy',
+      body: 'Body',
+    });
+
+    expect(result.success).toBe(true);
+    const draft = provider.getDrafts().get(result.draftId!)!;
+    expect(draft.bcc).toEqual([{ name: 'Carol Jones', email: 'carol@hidden.com' }]);
+    expect(draft.cc).toEqual([{ name: 'Bob', email: 'bob@allowed.com' }]);
+  });
+
+  it('create_draft returns INVALID_ADDRESS for a malformed bcc', async () => {
+    const result = await createDraftAction.run(ctx, {
+      to: 'alice@allowed.com',
+      bcc: ['not an email'],
+      subject: 'Bad bcc',
+      body: 'Body',
+    });
+    expect(result.success).toBe(false);
+    expect(result.error!.code).toBe('INVALID_ADDRESS');
+    expect(result.error!.message).toContain('bcc[0]');
+  });
+
+  it('create_draft with bcc to a blocked address still succeeds (drafts bypass allowlist)', async () => {
+    const result = await createDraftAction.run(ctx, {
+      to: 'alice@allowed.com',
+      bcc: ['secret@blocked.com'],
+      subject: 'Hidden',
+      body: 'Body',
+    });
+    expect(result.success).toBe(true);
+    expect(provider.getDrafts().get(result.draftId!)!.bcc).toEqual([{ email: 'secret@blocked.com' }]);
+  });
+
   it('update_draft with cc: [] explicitly clears cc', async () => {
     const created = await createDraftAction.run(ctx, {
       to: 'alice@allowed.com',
@@ -717,6 +827,32 @@ describe('email-write/Draft Address Parsing', () => {
     expect(updated.success).toBe(true);
     const draft = provider.getDrafts().get(created.draftId!)!;
     expect(draft.cc).toEqual([]);
+  });
+
+  it('update_draft parses bcc and can clear it with an empty array', async () => {
+    const created = await createDraftAction.run(ctx, {
+      to: 'alice@allowed.com',
+      bcc: ['hidden@allowed.com'],
+      subject: 'Original',
+      body: 'Body',
+    });
+    expect(created.success).toBe(true);
+
+    const updated = await updateDraftAction.run(ctx, {
+      draft_id: created.draftId!,
+      bcc: ['Audit <audit@allowed.com>'],
+    });
+    expect(updated.success).toBe(true);
+    expect(provider.getDrafts().get(created.draftId!)!.bcc).toEqual([
+      { name: 'Audit', email: 'audit@allowed.com' },
+    ]);
+
+    const cleared = await updateDraftAction.run(ctx, {
+      draft_id: created.draftId!,
+      bcc: [],
+    });
+    expect(cleared.success).toBe(true);
+    expect(provider.getDrafts().get(created.draftId!)!.bcc).toEqual([]);
   });
 
   it('update_draft returns INVALID_ADDRESS for bad input', async () => {
@@ -1544,5 +1680,238 @@ describe('email-write/Reply Scope Control', () => {
       expect.any(String),
       expect.objectContaining({ replyAll: false }),
     );
+  });
+});
+
+describe('email-write/Caller Tracking Id', () => {
+  it('create_draft threads tracking_id onto ComposeMessage', async () => {
+    const result = await createDraftAction.run(ctx, {
+      to: 'alice@allowed.com',
+      subject: 'Tracked',
+      body: 'Hello',
+      tracking_id: 'create-timeout-1',
+    });
+
+    expect(result.success).toBe(true);
+    expect(provider.getDrafts().get(result.draftId!)!.trackingId).toBe('create-timeout-1');
+  });
+
+  it('create_draft reply path threads tracking_id onto ReplyOptions', async () => {
+    provider.addMessage({
+      id: 'orig-tracked-msg',
+      subject: 'Original',
+      from: { email: 'partner@allowed.com' },
+      to: [{ email: 'me@company.com' }],
+      receivedAt: '2024-01-01T00:00:00Z',
+      isRead: true,
+      hasAttachments: false,
+    });
+    const draftSpy = vi.spyOn(provider, 'createReplyDraft');
+
+    const result = await createDraftAction.run(ctx, {
+      reply_to: 'orig-tracked-msg',
+      to: 'partner@allowed.com',
+      subject: 'Re: Original',
+      body: 'Tracked reply draft.',
+      tracking_id: 'reply-draft-1',
+    });
+
+    expect(result.success).toBe(true);
+    expect(draftSpy).toHaveBeenCalledWith(
+      'orig-tracked-msg',
+      expect.any(String),
+      expect.objectContaining({ trackingId: 'reply-draft-1' }),
+    );
+    expect(provider.getDrafts().get(result.draftId!)!.trackingId).toBe('reply-draft-1');
+  });
+
+  it('create_draft rejects a tracking_id that cannot be matched exactly', async () => {
+    const result = await createDraftAction.run(ctx, {
+      to: 'alice@allowed.com',
+      subject: 'Bad id',
+      body: 'Hello',
+      tracking_id: 'has space',
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.error?.code).toBe('INVALID_TRACKING_ID');
+    expect(provider.getDrafts().size).toBe(0);
+  });
+
+  it('find_draft_by_tracking_id returns the exact draft and not a prefix neighbor', async () => {
+    const created = await createDraftAction.run(ctx, {
+      to: 'alice@allowed.com',
+      subject: 'Exact',
+      body: 'Hello',
+      tracking_id: 'track-100',
+    });
+    await createDraftAction.run(ctx, {
+      to: 'alice@allowed.com',
+      subject: 'Neighbor',
+      body: 'Hello',
+      tracking_id: 'track-1000',
+    });
+
+    const found = await findDraftByTrackingIdAction.run(ctx, { tracking_id: 'track-100' });
+    const missing = await findDraftByTrackingIdAction.run(ctx, { tracking_id: 'track-10' });
+
+    expect(found).toEqual({
+      success: true,
+      draftId: created.draftId,
+      messageId: created.draftId,
+    });
+    expect(missing).toMatchObject({
+      success: false,
+      error: { code: 'DRAFT_NOT_FOUND', recoverable: false },
+    });
+  });
+
+  it('find_draft_by_tracking_id fails closed when two drafts share the same id', async () => {
+    await createDraftAction.run(ctx, {
+      to: 'alice@allowed.com',
+      subject: 'One',
+      body: 'Hello',
+      tracking_id: 'dup-id',
+    });
+    await createDraftAction.run(ctx, {
+      to: 'alice@allowed.com',
+      subject: 'Two',
+      body: 'Hello',
+      tracking_id: 'dup-id',
+    });
+
+    const result = await findDraftByTrackingIdAction.run(ctx, { tracking_id: 'dup-id' });
+    expect(result.success).toBe(false);
+    expect(result.error?.code).toBe('TRACKING_ID_AMBIGUOUS');
+  });
+
+  it('find_draft_by_tracking_id returns NOT_SUPPORTED when the provider cannot look up', async () => {
+    Object.defineProperty(provider, 'findDraftByTrackingId', { value: undefined });
+    const result = await findDraftByTrackingIdAction.run(ctx, { tracking_id: 'any-id' });
+    expect(result).toMatchObject({
+      success: false,
+      error: { code: 'NOT_SUPPORTED', recoverable: false },
+    });
+  });
+});
+
+describe('email-write/Draft Attachment Mutations', () => {
+  const pdf = Buffer.from('%PDF-1.4\n1 0 obj<<>>endobj\n', 'utf-8');
+
+  async function createDraftWithAttachment(): Promise<string> {
+    await writeFile(join(testDir, 'existing.pdf'), pdf);
+    const created = await createDraftAction.run(ctx, {
+      to: 'alice@allowed.com',
+      subject: 'With file',
+      body: 'Hello',
+      attachments: [{ path: 'existing.pdf' }],
+    });
+    expect(created.success).toBe(true);
+    return created.draftId!;
+  }
+
+  it('add_draft_attachments appends files without dropping existing ones or sending', async () => {
+    const draftId = await createDraftWithAttachment();
+    await writeFile(join(testDir, 'extra.pdf'), pdf);
+    const sendSpy = vi.spyOn(provider, 'sendMessage');
+    const sendDraftSpy = vi.spyOn(provider, 'sendDraft');
+
+    const result = await addDraftAttachmentsAction.run(ctx, {
+      draft_id: draftId,
+      attachments: [{ path: 'extra.pdf' }],
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.draftId).toBe(draftId);
+    expect(result.attachments).toHaveLength(2);
+    expect(result.attachments?.map(a => a.filename)).toEqual(['existing.pdf', 'extra.pdf']);
+    expect(provider.getDrafts().get(draftId)!.attachments).toHaveLength(2);
+    expect(sendSpy).not.toHaveBeenCalled();
+    expect(sendDraftSpy).not.toHaveBeenCalled();
+    expect(provider.getSentMessages()).toHaveLength(0);
+  });
+
+  it('remove_draft_attachments deletes only the named id', async () => {
+    const draftId = await createDraftWithAttachment();
+    await writeFile(join(testDir, 'extra.pdf'), pdf);
+    await addDraftAttachmentsAction.run(ctx, {
+      draft_id: draftId,
+      attachments: [{ path: 'extra.pdf' }],
+    });
+    const before = (await provider.getMessage(draftId)).attachments ?? [];
+    expect(before).toHaveLength(2);
+    const dropId = before.find(attachment => attachment.filename === 'existing.pdf')!.id;
+
+    const result = await removeDraftAttachmentsAction.run(ctx, {
+      draft_id: draftId,
+      attachment_ids: [dropId],
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.attachments).toHaveLength(1);
+    expect(result.attachments![0]!.filename).toBe('extra.pdf');
+    expect(provider.getSentMessages()).toHaveLength(0);
+  });
+
+  it('remove_draft_attachments fails closed when an id is missing and does not drop unnamed files', async () => {
+    const draftId = await createDraftWithAttachment();
+    const before = (await provider.getMessage(draftId)).attachments ?? [];
+
+    const result = await removeDraftAttachmentsAction.run(ctx, {
+      draft_id: draftId,
+      attachment_ids: [before[0]!.id, 'missing-att'],
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.error?.code).toBe('ATTACHMENT_NOT_FOUND');
+    expect(provider.getDrafts().get(draftId)!.attachments).toHaveLength(1);
+  });
+
+  it('returns NOT_SUPPORTED when the provider has no attachment-level API and names the wholesale-replace alternative', async () => {
+    const draftId = await createDraftWithAttachment();
+    Object.defineProperty(provider, 'addDraftAttachments', { value: undefined });
+    Object.defineProperty(provider, 'removeDraftAttachments', { value: undefined });
+
+    const added = await addDraftAttachmentsAction.run(ctx, {
+      draft_id: draftId,
+      attachments: [{ path: 'existing.pdf' }],
+    });
+    const removed = await removeDraftAttachmentsAction.run(ctx, {
+      draft_id: draftId,
+      attachment_ids: ['att-1'],
+    });
+
+    expect(added).toMatchObject({
+      success: false,
+      error: { code: 'NOT_SUPPORTED', recoverable: false },
+    });
+    expect(added.error?.message).toContain('update_draft');
+    expect(added.error?.message).toContain('attachments');
+    expect(removed).toMatchObject({
+      success: false,
+      error: { code: 'NOT_SUPPORTED', recoverable: false },
+    });
+    expect(removed.error?.message).toContain('update_draft');
+    expect(provider.getDrafts().get(draftId)!.attachments).toHaveLength(1);
+  });
+
+  it('requires mailbox when multiple accounts are configured', async () => {
+    const multi: ActionContext = {
+      ...ctx,
+      allMailboxes: [
+        { name: 'work', emailAddress: 'me@company.com', provider, providerType: 'microsoft', isDefault: true, status: 'connected' },
+        { name: 'personal', emailAddress: 'me@home.com', provider, providerType: 'microsoft', isDefault: false, status: 'connected' },
+      ],
+    };
+    const added = await addDraftAttachmentsAction.run(multi, {
+      draft_id: 'draft-1',
+      attachments: [{ base64: pdf.toString('base64'), filename: 'note.pdf' }],
+    });
+    const removed = await removeDraftAttachmentsAction.run(multi, {
+      draft_id: 'draft-1',
+      attachment_ids: ['att-1'],
+    });
+    expect(added.error?.code).toBe('MAILBOX_REQUIRED');
+    expect(removed.error?.code).toBe('MAILBOX_REQUIRED');
   });
 });

@@ -1018,6 +1018,114 @@ describe('provider-microsoft/Draft-Then-Send via createReplyAll', () => {
       value: 'reply',
     });
   });
+
+  it('createReplyDraft writes AgentEmailTrackingId when trackingId is supplied', async () => {
+    const client = createMockClient({
+      post: vi.fn().mockResolvedValueOnce(quotedReplyResponse()),
+    });
+    const provider = new GraphEmailProvider(client);
+
+    await provider.createReplyDraft('msg-1', 'reply', {
+      bodyHtml: '<p>rendered</p>',
+      trackingId: 'reply-timeout-1',
+    });
+
+    const patch = (client.patch as ReturnType<typeof vi.fn>).mock.calls[0]![1] as {
+      singleValueExtendedProperties: Array<{ id: string; value: string }>;
+    };
+    expect(patch.singleValueExtendedProperties).toContainEqual({
+      id: 'String {66f5a359-4659-4830-9070-00047ec6ac6e} Name AgentEmailTrackingId',
+      value: 'reply-timeout-1',
+    });
+  });
+});
+
+describe('provider-microsoft/Forward Drafts', () => {
+  it('Scenario: createForwardDraft PATCHes recipients and comment without sending', async () => {
+    const client = createMockClient({
+      post: vi.fn().mockResolvedValueOnce(quotedReplyResponse({ id: 'fwd-draft-1' })),
+    });
+    const provider = new GraphEmailProvider(client);
+
+    const result = await provider.createForwardDraft('msg-1', {
+      to: [{ email: 'bob@corp.com', name: 'Bob' }],
+      cc: [{ email: 'carol@corp.com' }],
+      comment: 'Please review',
+      bodyHtml: '<p>Please review</p>',
+    });
+
+    expect(result).toEqual({ success: true, draftId: 'fwd-draft-1' });
+    expect(client.post).toHaveBeenCalledTimes(1);
+    expect(client.post).toHaveBeenCalledWith(
+      '/me/messages/msg-1/createForward',
+      {},
+    );
+    expect(client.post).not.toHaveBeenCalledWith(
+      expect.stringContaining('/send'),
+      expect.anything(),
+    );
+    const patchArgs = (client.patch as ReturnType<typeof vi.fn>).mock.calls[0]!;
+    expect(patchArgs[0]).toBe('/me/messages/fwd-draft-1');
+    const patch = patchArgs[1] as {
+      toRecipients: Array<{ emailAddress: { address: string; name?: string } }>;
+      ccRecipients: Array<{ emailAddress: { address: string } }>;
+      body: { content: string };
+      singleValueExtendedProperties: Array<{ id: string; value: string }>;
+    };
+    expect(patch.toRecipients).toEqual([
+      { emailAddress: { address: 'bob@corp.com', name: 'Bob' } },
+    ]);
+    expect(patch.ccRecipients.map(r => r.emailAddress.address)).toEqual(['carol@corp.com']);
+    expect(patch.body.content).toContain('<p>Please review</p>');
+    expect(patch.body.content).toContain('From:</b> Alice');
+    expect(patch.singleValueExtendedProperties).toContainEqual({
+      id: 'String {66f5a359-4659-4830-9070-00047ec6ac6e} Name AgentEmailDraftOrigin',
+      value: 'reply',
+    });
+  });
+
+  it('Scenario: createForwardDraft with no comment leaves Graph quoted body in place', async () => {
+    const client = createMockClient({
+      post: vi.fn().mockResolvedValueOnce(quotedReplyResponse({ id: 'fwd-draft-2' })),
+    });
+    const provider = new GraphEmailProvider(client);
+
+    const result = await provider.createForwardDraft('msg-1', {
+      to: [{ email: 'bob@corp.com' }],
+    });
+
+    expect(result.success).toBe(true);
+    const patch = (client.patch as ReturnType<typeof vi.fn>).mock.calls[0]![1] as Record<string, unknown>;
+    expect(patch).not.toHaveProperty('body');
+    expect(patch.toRecipients).toEqual([
+      { emailAddress: { address: 'bob@corp.com', name: undefined } },
+    ]);
+  });
+
+  it('Scenario: createForwardDraft posts caller attachments after the PATCH', async () => {
+    const client = createMockClient({
+      post: vi.fn()
+        .mockResolvedValueOnce(quotedReplyResponse({ id: 'fwd-att' }))
+        .mockResolvedValueOnce({ id: 'att-1' }),
+    });
+    const provider = new GraphEmailProvider(client);
+    const pdf = Buffer.from('%PDF-1.4\nbytes', 'utf-8');
+
+    const result = await provider.createForwardDraft('msg-1', {
+      to: [{ email: 'bob@corp.com' }],
+      attachments: [{ filename: 'note.pdf', content: pdf, mimeType: 'application/pdf' }],
+    });
+
+    expect(result.success).toBe(true);
+    const attCall = (client.post as ReturnType<typeof vi.fn>).mock.calls.find(
+      c => String(c[0]).endsWith('/attachments'),
+    );
+    expect(attCall).toBeDefined();
+    expect(client.post).not.toHaveBeenCalledWith(
+      expect.stringContaining('/send'),
+      expect.anything(),
+    );
+  });
 });
 
 describe('provider-microsoft/Deferred Delivery via Graph Extended Property', () => {
@@ -1202,7 +1310,7 @@ describe('provider-microsoft/Graph Scheduled Send Inspection and Cancellation', 
     );
   });
 
-  it('Scenario: Cancellation verifies before delete', async () => {
+  it('Scenario: Cancellation verifies before moving to Deleted Items', async () => {
     const get = vi.fn().mockResolvedValue({
       id: 'AAMk/scheduled+=',
       isDraft: true,
@@ -1219,9 +1327,11 @@ describe('provider-microsoft/Graph Scheduled Send Inspection and Cancellation', 
     expect(get).toHaveBeenCalledWith(
       expect.stringContaining('/me/messages/AAMk%2Fscheduled%2B%3D?'),
     );
-    expect(client.delete).toHaveBeenCalledWith(
-      '/me/messages/AAMk%2Fscheduled%2B%3D',
+    expect(client.post).toHaveBeenCalledWith(
+      '/me/messages/AAMk%2Fscheduled%2B%3D/move',
+      { destinationId: 'deleteditems' },
     );
+    expect(client.delete).not.toHaveBeenCalled();
 
     const unsafeClient = createMockClient({
       get: vi.fn().mockResolvedValue({
@@ -1233,6 +1343,7 @@ describe('provider-microsoft/Graph Scheduled Send Inspection and Cancellation', 
     const unsafeProvider = new GraphEmailProvider(unsafeClient);
     await expect(unsafeProvider.cancelScheduledSend('ordinary'))
       .rejects.toMatchObject({ code: 'NOT_SCHEDULED' });
+    expect(unsafeClient.post).not.toHaveBeenCalled();
     expect(unsafeClient.delete).not.toHaveBeenCalled();
   });
 
@@ -1283,7 +1394,7 @@ describe('provider-microsoft/Graph Scheduled Send Inspection and Cancellation', 
       .rejects.toMatchObject({ code: 'NOT_SCHEDULED' });
     expect(missingBeforeGet.delete).not.toHaveBeenCalled();
 
-    const missingDuringDelete = createMockClient({
+    const missingDuringMove = createMockClient({
       get: vi.fn().mockResolvedValue({
         id: 'race',
         isDraft: true,
@@ -1292,10 +1403,103 @@ describe('provider-microsoft/Graph Scheduled Send Inspection and Cancellation', 
           value: '2026-07-24T12:00:00Z',
         }],
       }),
-      delete: vi.fn().mockRejectedValue(new GraphApiError(404, 'ErrorItemNotFound')),
+      post: vi.fn().mockRejectedValue(new GraphApiError(404, 'ErrorItemNotFound')),
     });
-    await expect(new GraphEmailProvider(missingDuringDelete).cancelScheduledSend('race'))
+    await expect(new GraphEmailProvider(missingDuringMove).cancelScheduledSend('race'))
       .rejects.toMatchObject({ code: 'NOT_SCHEDULED' });
+    expect(missingDuringMove.delete).not.toHaveBeenCalled();
+  });
+
+  it('falls back to DELETE when Graph rejects moving a deferred item', async () => {
+    const client = createMockClient({
+      get: vi.fn().mockResolvedValue({
+        id: 'deferred-1',
+        isDraft: true,
+        singleValueExtendedProperties: [{
+          id: 'SystemTime 0x3FEF',
+          value: '2026-07-24T12:00:00Z',
+        }],
+      }),
+      post: vi.fn().mockRejectedValue(new GraphApiError(403, 'ErrorAccessDenied')),
+    });
+    const provider = new GraphEmailProvider(client);
+
+    await provider.cancelScheduledSend('deferred-1');
+
+    expect(client.post).toHaveBeenCalledWith(
+      '/me/messages/deferred-1/move',
+      { destinationId: 'deleteditems' },
+    );
+    expect(client.delete).toHaveBeenCalledWith('/me/messages/deferred-1');
+  });
+
+  it('falls back to DELETE when Graph refuses the move with 500 ErrorMoveCopyFailed', async () => {
+    // Live canary 2026-09-15: a submitted deferred-send draft is locked by Graph, so
+    // POST /move answers 500 ErrorMoveCopyFailed (not 400/403). Without this branch the
+    // error rethrows and cancellation is impossible, which is worse than a destructive
+    // cancel: the message still delivers.
+    const client = createMockClient({
+      get: vi.fn().mockResolvedValue({
+        id: 'deferred-500',
+        isDraft: true,
+        singleValueExtendedProperties: [{
+          id: 'SystemTime 0x3FEF',
+          value: '2026-07-24T12:00:00Z',
+        }],
+      }),
+      post: vi.fn().mockRejectedValue(
+        new GraphApiError(500, '{"error":{"code":"ErrorMoveCopyFailed","message":"The move or copy operation failed."}}'),
+      ),
+    });
+    const provider = new GraphEmailProvider(client);
+
+    await provider.cancelScheduledSend('deferred-500');
+
+    expect(client.post).toHaveBeenCalledWith(
+      '/me/messages/deferred-500/move',
+      { destinationId: 'deleteditems' },
+    );
+    expect(client.delete).toHaveBeenCalledWith('/me/messages/deferred-500');
+  });
+
+  it('does not fall back to DELETE on an unrelated 500', async () => {
+    // Only the move-refusal signature may unlock the destructive path; a generic server
+    // error must surface so a transient Graph fault never silently destroys a draft.
+    const client = createMockClient({
+      get: vi.fn().mockResolvedValue({
+        id: 'deferred-500-other',
+        isDraft: true,
+        singleValueExtendedProperties: [{
+          id: 'SystemTime 0x3FEF',
+          value: '2026-07-24T12:00:00Z',
+        }],
+      }),
+      post: vi.fn().mockRejectedValue(
+        new GraphApiError(500, '{"error":{"code":"InternalServerError"}}'),
+      ),
+    });
+
+    await expect(new GraphEmailProvider(client).cancelScheduledSend('deferred-500-other'))
+      .rejects.toMatchObject({ status: 500 });
+    expect(client.delete).not.toHaveBeenCalled();
+  });
+
+  it('does not fall back to DELETE on a throttled move', async () => {
+    const client = createMockClient({
+      get: vi.fn().mockResolvedValue({
+        id: 'deferred-429',
+        isDraft: true,
+        singleValueExtendedProperties: [{
+          id: 'SystemTime 0x3FEF',
+          value: '2026-07-24T12:00:00Z',
+        }],
+      }),
+      post: vi.fn().mockRejectedValue(new GraphApiError(429, 'Too many requests')),
+    });
+
+    await expect(new GraphEmailProvider(client).cancelScheduledSend('deferred-429'))
+      .rejects.toMatchObject({ status: 429 });
+    expect(client.delete).not.toHaveBeenCalled();
   });
 });
 
@@ -1633,6 +1837,114 @@ describe('provider-microsoft/Sent Message Tracking', () => {
       (p: { value: string }) => p.value === 'tracking-123',
     );
     expect(trackingProp).toBeDefined();
+  });
+});
+
+describe('provider-microsoft/Draft Tracking Id', () => {
+  const trackingProperty = 'String {66f5a359-4659-4830-9070-00047ec6ac6e} Name AgentEmailTrackingId';
+
+  it('createDraft writes AgentEmailTrackingId when trackingId is supplied', async () => {
+    const client = createMockClient();
+    const provider = new GraphEmailProvider(client);
+
+    await provider.createDraft({
+      to: [{ email: 'alice@corp.com' }],
+      subject: 'Tracked draft',
+      body: 'Hello',
+      trackingId: 'create-timeout-1',
+    });
+
+    const payload = (client.post as ReturnType<typeof vi.fn>).mock.calls[0]![1] as {
+      singleValueExtendedProperties: Array<{ id: string; value: string }>;
+    };
+    expect(payload.singleValueExtendedProperties).toContainEqual({
+      id: trackingProperty,
+      value: 'create-timeout-1',
+    });
+  });
+
+  it('createDraft omits AgentEmailTrackingId when trackingId is absent', async () => {
+    const client = createMockClient();
+    const provider = new GraphEmailProvider(client);
+
+    await provider.createDraft({
+      to: [{ email: 'alice@corp.com' }],
+      subject: 'Untracked draft',
+      body: 'Hello',
+    });
+
+    const payload = (client.post as ReturnType<typeof vi.fn>).mock.calls[0]![1] as {
+      singleValueExtendedProperties: Array<{ id: string; value: string }>;
+    };
+    expect(payload.singleValueExtendedProperties.some(p => p.id === trackingProperty)).toBe(false);
+  });
+
+  it('findDraftByTrackingId uses an exact extended-property filter and ignores a prefix neighbor', async () => {
+    const get = vi.fn().mockResolvedValue({
+      value: [{
+        id: 'draft-exact',
+        isDraft: true,
+        singleValueExtendedProperties: [{
+          id: trackingProperty,
+          value: 'track-100',
+        }],
+      }],
+    });
+    const provider = new GraphEmailProvider(createMockClient({ get }));
+
+    const found = await provider.findDraftByTrackingId('track-100');
+
+    expect(found).toEqual({ draftId: 'draft-exact', messageId: 'draft-exact' });
+    const url = decodeURIComponent((get.mock.calls[0]![0] as string));
+    expect(url).toContain("/mailFolders/drafts/messages");
+    expect(url).toContain(`ep/id eq '${trackingProperty}'`);
+    expect(url).toContain("ep/value eq 'track-100'");
+    expect(url).not.toContain('contains(');
+    expect(url).not.toContain('startswith(');
+  });
+
+  it('findDraftByTrackingId returns null when the exact value is absent', async () => {
+    const provider = new GraphEmailProvider(createMockClient({
+      get: vi.fn().mockResolvedValue({ value: [] }),
+    }));
+    await expect(provider.findDraftByTrackingId('missing-id')).resolves.toBeNull();
+  });
+
+  it('findDraftByTrackingId rejects a Graph hit whose stored value is not an exact match', async () => {
+    const provider = new GraphEmailProvider(createMockClient({
+      get: vi.fn().mockResolvedValue({
+        value: [{
+          id: 'draft-neighbor',
+          isDraft: true,
+          singleValueExtendedProperties: [{
+            id: trackingProperty,
+            value: 'track-1000',
+          }],
+        }],
+      }),
+    }));
+    await expect(provider.findDraftByTrackingId('track-100')).resolves.toBeNull();
+  });
+
+  it('findDraftByTrackingId fails closed when two drafts share the id', async () => {
+    const provider = new GraphEmailProvider(createMockClient({
+      get: vi.fn().mockResolvedValue({
+        value: [
+          {
+            id: 'draft-a',
+            isDraft: true,
+            singleValueExtendedProperties: [{ id: trackingProperty, value: 'dup-id' }],
+          },
+          {
+            id: 'draft-b',
+            isDraft: true,
+            singleValueExtendedProperties: [{ id: trackingProperty, value: 'dup-id' }],
+          },
+        ],
+      }),
+    }));
+    await expect(provider.findDraftByTrackingId('dup-id'))
+      .rejects.toMatchObject({ code: 'TRACKING_ID_AMBIGUOUS' });
   });
 });
 
@@ -2697,5 +3009,128 @@ describe('provider-microsoft/Outbound Attachments', () => {
     expect(client.delete).toHaveBeenCalledWith(expect.stringContaining('/attachments/old-att'));
     const attCalls = (client.post as MockFn).mock.calls.filter(c => String(c[0]).endsWith('/attachments'));
     expect(attCalls).toHaveLength(1);
+  });
+});
+
+describe('provider-microsoft/Draft Attachment Mutations', () => {
+  const PDF = Buffer.from('%PDF-1.4\nbytes', 'utf-8');
+  type MockFn = ReturnType<typeof vi.fn>;
+
+  it('addDraftAttachments POSTs onto the collection without deleting existing files or sending', async () => {
+    const client = createMockClient({
+      get: vi.fn().mockResolvedValue({ id: 'draft-1', isDraft: true }),
+    });
+    const provider = new GraphEmailProvider(client);
+
+    const result = await provider.addDraftAttachments('draft-1', [
+      { filename: 'extra.pdf', content: PDF, mimeType: 'application/pdf' },
+    ]);
+
+    expect(result.success).toBe(true);
+    expect(result.draftId).toBe('draft-1');
+    expect(client.get).toHaveBeenCalledWith('/me/messages/draft-1?$select=id,isDraft');
+    const attCalls = (client.post as MockFn).mock.calls.filter(c => String(c[0]).endsWith('/attachments'));
+    expect(attCalls).toHaveLength(1);
+    expect(attCalls[0]![1]).toMatchObject({
+      '@odata.type': '#microsoft.graph.fileAttachment',
+      name: 'extra.pdf',
+      contentBytes: PDF.toString('base64'),
+    });
+    expect(client.delete).not.toHaveBeenCalled();
+    expect((client.post as MockFn).mock.calls.every(c => !String(c[0]).endsWith('/send'))).toBe(true);
+  });
+
+  it('addDraftAttachments rejects an oversize file before any Graph call', async () => {
+    const client = createMockClient();
+    const provider = new GraphEmailProvider(client);
+
+    const result = await provider.addDraftAttachments('draft-1', [{
+      filename: 'big.bin',
+      content: Buffer.alloc(3 * 1024 * 1024 + 1),
+      mimeType: 'application/octet-stream',
+    }]);
+
+    expect(result.success).toBe(false);
+    expect(result.error?.code).toBe('ATTACHMENT_TOO_LARGE_FOR_PROVIDER');
+    expect(client.get).not.toHaveBeenCalled();
+    expect(client.post).not.toHaveBeenCalled();
+  });
+
+  it('addDraftAttachments refuses a non-draft without posting', async () => {
+    const client = createMockClient({
+      get: vi.fn().mockResolvedValue({ id: 'sent-1', isDraft: false }),
+    });
+    const provider = new GraphEmailProvider(client);
+
+    const result = await provider.addDraftAttachments('sent-1', [
+      { filename: 'extra.pdf', content: PDF, mimeType: 'application/pdf' },
+    ]);
+
+    expect(result.success).toBe(false);
+    expect(result.error?.code).toBe('NOT_A_DRAFT');
+    expect(client.post).not.toHaveBeenCalled();
+  });
+
+  it('removeDraftAttachments DELETEs only the named ids', async () => {
+    const client = createMockClient({
+      get: vi.fn(async (url: string) => {
+        if (String(url).includes('/attachments')) {
+          return { value: [{ id: 'keep-att' }, { id: 'drop-att' }] };
+        }
+        return { id: 'draft-1', isDraft: true };
+      }),
+    });
+    const provider = new GraphEmailProvider(client);
+
+    const result = await provider.removeDraftAttachments('draft-1', ['drop-att']);
+
+    expect(result.success).toBe(true);
+    expect(client.delete).toHaveBeenCalledTimes(1);
+    expect(client.delete).toHaveBeenCalledWith('/me/messages/draft-1/attachments/drop-att');
+    expect(client.delete).not.toHaveBeenCalledWith(expect.stringContaining('keep-att'));
+    expect((client.post as MockFn).mock.calls.every(c => !String(c[0]).endsWith('/send'))).toBe(true);
+  });
+
+  it('removeDraftAttachments fails closed when an id is missing and deletes nothing', async () => {
+    const client = createMockClient({
+      get: vi.fn(async (url: string) => {
+        if (String(url).includes('/attachments')) {
+          return { value: [{ id: 'keep-att' }] };
+        }
+        return { id: 'draft-1', isDraft: true };
+      }),
+    });
+    const provider = new GraphEmailProvider(client);
+
+    const result = await provider.removeDraftAttachments('draft-1', ['keep-att', 'missing-att']);
+
+    expect(result.success).toBe(false);
+    expect(result.error?.code).toBe('ATTACHMENT_NOT_FOUND');
+    expect(client.delete).not.toHaveBeenCalled();
+  });
+
+  it('encodes draft and attachment ids on add and remove', async () => {
+    const client = createMockClient({
+      get: vi.fn(async (url: string) => {
+        if (String(url).includes('/attachments')) {
+          return { value: [{ id: 'AAA/BBB+CCC=' }] };
+        }
+        return { id: 'AAMk/draft+=', isDraft: true };
+      }),
+    });
+    const provider = new GraphEmailProvider(client);
+
+    await provider.addDraftAttachments('AAMk/draft+=', [
+      { filename: 'note.pdf', content: PDF, mimeType: 'application/pdf' },
+    ]);
+    await provider.removeDraftAttachments('AAMk/draft+=', ['AAA/BBB+CCC=']);
+
+    expect(client.post).toHaveBeenCalledWith(
+      '/me/messages/AAMk%2Fdraft%2B%3D/attachments',
+      expect.any(Object),
+    );
+    expect(client.delete).toHaveBeenCalledWith(
+      '/me/messages/AAMk%2Fdraft%2B%3D/attachments/AAA%2FBBB%2BCCC%3D',
+    );
   });
 });

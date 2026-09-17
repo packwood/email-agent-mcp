@@ -15,6 +15,8 @@ export type {
   EmailError,
   ListOptions,
   ReplyOptions,
+  ForwardOptions,
+  DraftLookupResult,
 } from './types.js';
 export type {
   EmailReader,
@@ -63,11 +65,15 @@ export {
   getSearchEmailThreadFields,
 } from './actions/search.js';
 export { replyToEmailAction } from './actions/reply.js';
+export { createForwardDraftAction } from './actions/forward.js';
 export {
   createDraftAction,
+  findDraftByTrackingIdAction,
   inspectDraftExactAction,
   sendDraftAction,
   updateDraftAction,
+  addDraftAttachmentsAction,
+  removeDraftAttachmentsAction,
 } from './actions/draft.js';
 export {
   cancelScheduledSendAction,

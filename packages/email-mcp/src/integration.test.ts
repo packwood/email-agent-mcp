@@ -21,6 +21,10 @@ describe('provider-interface/Dynamic discovery — dist exports', () => {
     expect(emailCore.labelEmailAction).toBeDefined();
     expect(emailCore.flagEmailAction).toBeDefined();
     expect(emailCore.markReadAction).toBeDefined();
+    expect(emailCore.createForwardDraftAction).toBeDefined();
+    expect(emailCore.findDraftByTrackingIdAction).toBeDefined();
+    expect(emailCore.addDraftAttachmentsAction).toBeDefined();
+    expect(emailCore.removeDraftAttachmentsAction).toBeDefined();
     expect(emailCore.moveToFolderAction).toBeDefined();
     expect(emailCore.deleteEmailAction).toBeDefined();
     expect(emailCore.listFoldersAction).toBeDefined();

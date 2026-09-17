@@ -3,6 +3,7 @@ import type {
   EmailMessage,
   EmailThread,
   ComposeMessage,
+  OutboundAttachment,
   SendResult,
   DraftResult,
   ListOptions,
@@ -11,6 +12,8 @@ import type {
   EmailError,
   ScheduledSend,
   ScheduledSendResult,
+  ForwardOptions,
+  DraftLookupResult,
 } from '../types.js';
 
 export interface EmailReader {
@@ -23,6 +26,12 @@ export interface EmailReader {
    * same id from getMessage(draftId).
    */
   getDraftMessage?(draftId: string): Promise<EmailMessage>;
+  /**
+   * Resolve a draft by exact caller tracking id. Must not substring-match,
+   * prefix-match, or otherwise fuzzy-match. Return null when no draft carries
+   * that exact id; throw when more than one draft does.
+   */
+  findDraftByTrackingId?(trackingId: string): Promise<DraftLookupResult | null>;
   searchMessages(
     query: string,
     folder?: string,
@@ -44,8 +53,21 @@ export interface EmailSender {
   createDraft(msg: ComposeMessage): Promise<DraftResult>;
   sendDraft(draftId: string): Promise<SendResult>;
   createReplyDraft?(messageId: string, body: string, opts?: ReplyOptions): Promise<DraftResult>;
+  createForwardDraft?(messageId: string, opts: ForwardOptions): Promise<DraftResult>;
   getDraftReplyStatus?(draftId: string): Promise<DraftReplyStatus>;
   updateDraft?(draftId: string, msg: Partial<ComposeMessage>): Promise<DraftResult>;
+  /**
+   * POST new files onto an existing draft without replacing or sending.
+   * Providers without an attachment-level API must omit this method so the
+   * action layer can fail closed with NOT_SUPPORTED (Gmail: use update_draft
+   * with an explicit attachments array instead).
+   */
+  addDraftAttachments?(draftId: string, attachments: OutboundAttachment[]): Promise<DraftResult>;
+  /**
+   * DELETE only the named attachment ids from an existing draft. Must not
+   * remove an attachment the caller did not name, re-upload others, or send.
+   */
+  removeDraftAttachments?(draftId: string, attachmentIds: string[]): Promise<DraftResult>;
 }
 
 export type DraftReplyStatus = 'reply' | 'non_reply' | 'indeterminate';

@@ -1,10 +1,10 @@
 // Draft actions — create_draft, send_draft, update_draft
 import { z } from 'zod';
 import { createHash } from 'node:crypto';
-import type { EmailAction } from './registry.js';
+import type { ActionContext, EmailAction } from './registry.js';
 import { checkSendAllowlist } from '../security/send-allowlist.js';
 import { checkReplyThreading } from '../security/reply-validation.js';
-import { withRetry } from '../providers/provider.js';
+import { withRetry, type DraftReplyStatus } from '../providers/provider.js';
 import { truncateBody, BODY_SIZE_LIMIT } from '../content/body-loader.js';
 import { renderEmailBody } from '../content/body-renderer.js';
 import {
@@ -19,6 +19,7 @@ import {
   checkRateLimit,
   handleProviderError,
   parseRecipients,
+  parseTrackingId,
   buildDraftPreview,
   resolveAttachments,
   AttachmentInputSchema,
@@ -51,6 +52,8 @@ const DraftOutput = z.object({
 const CreateDraftInput = z.object({
   to: z.string().or(z.array(z.string())).optional(),
   cc: z.array(z.string()).optional(),
+  bcc: z.array(z.string()).optional()
+    .describe('Bcc recipients. Parsed with the same name-address grammar as to/cc. Drafts bypass the send allowlist; send_draft gates every To/Cc/Bcc address.'),
   subject: z.string().optional(),
   body: z.string().optional(),
   body_file: z.string().optional(),
@@ -66,6 +69,8 @@ const CreateDraftInput = z.object({
     .describe('Wrap rendered HTML in a force-black div so Outlook dark mode does not hide the text. Default true.'),
   attachments: z.array(AttachmentInputSchema).optional()
     .describe('Files to attach. Each entry takes a sandboxed `path` or inline `base64`.'),
+  tracking_id: z.string().optional()
+    .describe('Caller-supplied exact tracking id written onto the draft so a timed-out create can be reconciled instead of retried. Lookup is exact, never fuzzy.'),
 });
 
 export const createDraftAction: EmailAction<
@@ -90,7 +95,7 @@ export const createDraftAction: EmailAction<
       return { success: false, error: fields.error };
     }
 
-    const { to, cc, subject, replyTo, format, forceBlack } = fields;
+    const { to, cc, bcc, subject, replyTo, format, forceBlack } = fields;
     let { body } = fields;
 
     // Resolve attachments (sandboxed path reads + validation)
@@ -99,6 +104,11 @@ export const createDraftAction: EmailAction<
       return { success: false, error: attResult.error };
     }
     const attachments = attResult.files!;
+
+    const tracking = parseTrackingId(input.tracking_id);
+    if ('error' in tracking) {
+      return { success: false, error: tracking.error };
+    }
 
     // Validate required fields
     const requiredError = validateRequiredFields(to, subject);
@@ -109,7 +119,7 @@ export const createDraftAction: EmailAction<
     const recipients = Array.isArray(to) ? to : [to!];
 
     // Parse name-address strings into {name, email} once before any provider call.
-    const parsed = parseRecipients({ to: recipients, cc });
+    const parsed = parseRecipients({ to: recipients, cc, bcc });
     if ('error' in parsed) {
       return { success: false, error: parsed.error };
     }
@@ -146,9 +156,11 @@ export const createDraftAction: EmailAction<
       try {
         const result = await ctx.provider.createReplyDraft(replyTo, body, {
           cc: parsed.cc,
+          bcc: parsed.bcc.length > 0 ? parsed.bcc : undefined,
           bodyHtml: outBodyHtml,
           attachments: attachments.length > 0 ? attachments : undefined,
           replyAll: input.reply_all,
+          trackingId: tracking.trackingId,
         });
         const previewResult = result.success && result.draftId
           ? await buildDraftPreview(ctx.provider, result.draftId, {
@@ -171,10 +183,12 @@ export const createDraftAction: EmailAction<
       const result = await ctx.provider.createDraft({
         to: parsed.to,
         cc: parsed.cc,
+        bcc: parsed.bcc.length > 0 ? parsed.bcc : undefined,
         subject: subject!,
         body,
         bodyHtml: outBodyHtml,
         attachments: attachments.length > 0 ? attachments : undefined,
+        trackingId: tracking.trackingId,
       });
       const previewResult = result.success && result.draftId
         ? await buildDraftPreview(ctx.provider, result.draftId, {
@@ -326,6 +340,77 @@ export const sendDraftAction: EmailAction<
   },
 };
 
+// --- find_draft_by_tracking_id ---
+
+const FindDraftByTrackingIdInput = z.object({
+  tracking_id: z.string()
+    .describe('Exact caller tracking id previously supplied to create_draft or reply_to_email. Lookup is exact, never fuzzy.'),
+  mailbox: z.string().optional(),
+});
+
+const FindDraftByTrackingIdOutput = z.object({
+  success: z.boolean(),
+  draftId: z.string().optional(),
+  messageId: z.string().optional(),
+  error: z.object({
+    code: z.string(),
+    message: z.string(),
+    recoverable: z.boolean(),
+    availableMailboxes: z.array(z.string()).optional(),
+    defaultMailbox: z.string().optional(),
+  }).optional(),
+});
+
+export const findDraftByTrackingIdAction: EmailAction<
+  z.infer<typeof FindDraftByTrackingIdInput>,
+  z.infer<typeof FindDraftByTrackingIdOutput>
+> = {
+  name: 'find_draft_by_tracking_id',
+  description: 'Find a draft by exact caller tracking_id. Returns { draftId, messageId } or DRAFT_NOT_FOUND. Never fuzzy-matches.',
+  input: FindDraftByTrackingIdInput,
+  output: FindDraftByTrackingIdOutput,
+  annotations: { readOnlyHint: true, destructiveHint: false },
+  run: async (ctx, input) => {
+    const mailboxError = checkMailboxRequired(input.mailbox, ctx.allMailboxes);
+    if (mailboxError) {
+      return { success: false, error: mailboxError };
+    }
+
+    const tracking = parseTrackingId(input.tracking_id);
+    if ('error' in tracking) {
+      return { success: false, error: tracking.error };
+    }
+
+    if (!ctx.provider.findDraftByTrackingId) {
+      return {
+        success: false,
+        error: {
+          code: 'NOT_SUPPORTED',
+          message: 'Finding a draft by tracking_id is not supported by this email provider',
+          recoverable: false,
+        },
+      };
+    }
+
+    try {
+      const found = await ctx.provider.findDraftByTrackingId(tracking.trackingId!);
+      if (!found) {
+        return {
+          success: false,
+          error: {
+            code: 'DRAFT_NOT_FOUND',
+            message: `No draft found with tracking_id ${tracking.trackingId}`,
+            recoverable: false,
+          },
+        };
+      }
+      return { success: true, draftId: found.draftId, messageId: found.messageId };
+    } catch (err) {
+      return handleProviderError(err, 'DRAFT_LOOKUP_FAILED');
+    }
+  },
+};
+
 // --- inspect_draft_exact ---
 
 const InspectDraftExactInput = z.object({
@@ -356,6 +441,7 @@ const InspectDraftExactOutput = z.object({
     isInline: z.boolean(),
     sha256: z.string(),
   })),
+  replyStatus: z.enum(['reply', 'non_reply', 'indeterminate']).optional(),
 });
 
 const MAX_APPROVAL_ATTACHMENT_BYTES = 25 * 1024 * 1024;
@@ -416,6 +502,17 @@ export const inspectDraftExactAction: EmailAction<
     attachments.sort((a, b) =>
       `${a.filename}\0${a.id}`.localeCompare(`${b.filename}\0${b.id}`),
     );
+
+    let replyStatus: DraftReplyStatus | undefined;
+    if (ctx.provider.getDraftReplyStatus) {
+      try {
+        replyStatus = await ctx.provider.getDraftReplyStatus(input.draft_id);
+      } catch {
+        // Reply metadata must never fail an otherwise successful inspect.
+        replyStatus = 'indeterminate';
+      }
+    }
+
     return {
       draftId: input.draft_id,
       messageId: message.id,
@@ -427,6 +524,7 @@ export const inspectDraftExactAction: EmailAction<
       bodyHtml: message.bodyHtml ?? '',
       threadId: message.threadId ?? message.conversationId ?? '',
       attachments,
+      ...(replyStatus !== undefined ? { replyStatus } : {}),
     };
   },
 };
@@ -437,6 +535,8 @@ const UpdateDraftInput = z.object({
   draft_id: z.string(),
   to: z.string().or(z.array(z.string())).optional(),
   cc: z.array(z.string()).optional(),
+  bcc: z.array(z.string()).optional()
+    .describe('Bcc recipients. Parsed with the same name-address grammar as to/cc. An omitted list leaves existing Bcc unchanged; an empty array clears it.'),
   subject: z.string().optional(),
   body: z.string().optional(),
   body_file: z.string().optional(),
@@ -483,7 +583,7 @@ export const updateDraftAction: EmailAction<
       return { success: false, error: fields.error };
     }
 
-    const { to, cc, subject, format, forceBlack } = fields;
+    const { to, cc, bcc, subject, format, forceBlack } = fields;
     let { body } = fields;
     const hasBodyEdit = input.body !== undefined || input.body_file !== undefined;
 
@@ -528,16 +628,18 @@ export const updateDraftAction: EmailAction<
 
     // Build partial update — parse name-address strings only for fields the caller actually provided.
     const partial: Partial<import('../types.js').ComposeMessage> = {};
-    if (to !== undefined || cc !== undefined) {
+    if (to !== undefined || cc !== undefined || bcc !== undefined) {
       const parsed = parseRecipients({
         to: to !== undefined ? (Array.isArray(to) ? to : [to]) : undefined,
         cc,
+        bcc,
       });
       if ('error' in parsed) {
         return { success: false, error: parsed.error };
       }
       if (to !== undefined) partial.to = parsed.to;
       if (cc !== undefined) partial.cc = parsed.cc;
+      if (bcc !== undefined) partial.bcc = parsed.bcc;
     }
     if (subject) partial.subject = subject;
 
@@ -590,6 +692,157 @@ export const updateDraftAction: EmailAction<
       };
     } catch (err) {
       return handleProviderError(err, 'UPDATE_DRAFT_FAILED');
+    }
+  },
+};
+
+// --- add_draft_attachments / remove_draft_attachments ---
+
+const ATTACHMENT_LEVEL_NOT_SUPPORTED =
+  'Attachment-level add and remove is not supported by this email provider. Use update_draft with an explicit attachments array to replace the set wholesale.';
+
+const DraftAttachmentMutationErrorSchema = z.object({
+  code: z.string(),
+  message: z.string(),
+  recoverable: z.boolean(),
+  availableMailboxes: z.array(z.string()).optional(),
+  defaultMailbox: z.string().optional(),
+});
+
+const RemainingAttachmentSchema = z.object({
+  id: z.string(),
+  filename: z.string(),
+  mimeType: z.string(),
+  size: z.number(),
+  isInline: z.boolean(),
+});
+
+const DraftAttachmentMutationOutput = z.object({
+  success: z.boolean(),
+  draftId: z.string().optional(),
+  attachments: z.array(RemainingAttachmentSchema).optional(),
+  error: DraftAttachmentMutationErrorSchema.optional(),
+});
+
+async function remainingDraftAttachments(
+  provider: ActionContext['provider'],
+  draftId: string,
+): Promise<z.infer<typeof RemainingAttachmentSchema>[] | undefined> {
+  try {
+    const message = await (provider.getDraft?.(draftId) ?? provider.getMessage(draftId));
+    return (message.attachments ?? []).map(attachment => ({
+      id: attachment.id,
+      filename: attachment.filename,
+      mimeType: attachment.mimeType,
+      size: attachment.size,
+      isInline: attachment.isInline,
+    }));
+  } catch {
+    return undefined;
+  }
+}
+
+const AddDraftAttachmentsInput = z.object({
+  mailbox: z.string().optional(),
+  draft_id: z.string(),
+  attachments: z.array(AttachmentInputSchema).min(1)
+    .describe('Files to add to the draft. Existing attachments are left untouched. Each entry takes a sandboxed `path` or inline `base64`.'),
+});
+
+export const addDraftAttachmentsAction: EmailAction<
+  z.infer<typeof AddDraftAttachmentsInput>,
+  z.infer<typeof DraftAttachmentMutationOutput>
+> = {
+  name: 'add_draft_attachments',
+  description: 'Add files to an existing draft without replacing others or sending. Providers without an attachment-level API (Gmail) return NOT_SUPPORTED; use update_draft with an explicit attachments array instead.',
+  input: AddDraftAttachmentsInput,
+  output: DraftAttachmentMutationOutput,
+  annotations: { readOnlyHint: false, destructiveHint: false },
+  run: async (ctx, input) => {
+    const mailboxError = checkMailboxRequired(input.mailbox, ctx.allMailboxes);
+    if (mailboxError) {
+      return { success: false, error: mailboxError };
+    }
+
+    if (!ctx.provider.addDraftAttachments) {
+      return {
+        success: false,
+        error: { code: 'NOT_SUPPORTED', message: ATTACHMENT_LEVEL_NOT_SUPPORTED, recoverable: false },
+      };
+    }
+
+    const attResult = await resolveAttachments(input.attachments, ctx.safeDir);
+    if (attResult.error) {
+      return { success: false, error: attResult.error };
+    }
+
+    try {
+      const result = await ctx.provider.addDraftAttachments(input.draft_id, attResult.files!);
+      const attachments = result.success && result.draftId
+        ? await remainingDraftAttachments(ctx.provider, result.draftId)
+        : undefined;
+      return {
+        success: result.success,
+        draftId: result.draftId,
+        ...(attachments !== undefined ? { attachments } : {}),
+        error: result.error ? {
+          code: result.error.code,
+          message: result.error.message,
+          recoverable: result.error.recoverable,
+        } : undefined,
+      };
+    } catch (err) {
+      return handleProviderError(err, 'ATTACHMENT_UPDATE_FAILED');
+    }
+  },
+};
+
+const RemoveDraftAttachmentsInput = z.object({
+  mailbox: z.string().optional(),
+  draft_id: z.string(),
+  attachment_ids: z.array(z.string().min(1)).min(1)
+    .describe('Attachment ids to remove. Only these ids are deleted; unnamed attachments are left untouched.'),
+});
+
+export const removeDraftAttachmentsAction: EmailAction<
+  z.infer<typeof RemoveDraftAttachmentsInput>,
+  z.infer<typeof DraftAttachmentMutationOutput>
+> = {
+  name: 'remove_draft_attachments',
+  description: 'Remove named attachments from an existing draft without sending. Unnamed attachments are preserved. Providers without an attachment-level API (Gmail) return NOT_SUPPORTED; use update_draft with an explicit attachments array instead.',
+  input: RemoveDraftAttachmentsInput,
+  output: DraftAttachmentMutationOutput,
+  annotations: { readOnlyHint: false, destructiveHint: true },
+  run: async (ctx, input) => {
+    const mailboxError = checkMailboxRequired(input.mailbox, ctx.allMailboxes);
+    if (mailboxError) {
+      return { success: false, error: mailboxError };
+    }
+
+    if (!ctx.provider.removeDraftAttachments) {
+      return {
+        success: false,
+        error: { code: 'NOT_SUPPORTED', message: ATTACHMENT_LEVEL_NOT_SUPPORTED, recoverable: false },
+      };
+    }
+
+    try {
+      const result = await ctx.provider.removeDraftAttachments(input.draft_id, input.attachment_ids);
+      const attachments = result.success && result.draftId
+        ? await remainingDraftAttachments(ctx.provider, result.draftId)
+        : undefined;
+      return {
+        success: result.success,
+        draftId: result.draftId,
+        ...(attachments !== undefined ? { attachments } : {}),
+        error: result.error ? {
+          code: result.error.code,
+          message: result.error.message,
+          recoverable: result.error.recoverable,
+        } : undefined,
+      };
+    } catch (err) {
+      return handleProviderError(err, 'ATTACHMENT_UPDATE_FAILED');
     }
   },
 };

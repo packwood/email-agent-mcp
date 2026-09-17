@@ -353,6 +353,30 @@ export class MatonGmailApiClient implements GmailApiClient {
     return { id: response.id, messages: response.messages };
   }
 
+  async listDrafts(opts: { maxResults?: number; pageToken?: string } = {}): Promise<{
+    drafts?: Array<{ id: string; message: { id: string; threadId: string } }>;
+    nextPageToken?: string;
+  }> {
+    const params = new URLSearchParams();
+    if (opts.maxResults !== undefined) params.set('maxResults', String(opts.maxResults));
+    if (opts.pageToken) params.set('pageToken', opts.pageToken);
+    const query = params.size ? `?${params.toString()}` : '';
+    const response = await this.request<{
+      drafts?: GmailDraft[];
+      nextPageToken?: string | null;
+    }>(`/users/me/drafts${query}`, 'GET');
+    return {
+      drafts: response.drafts
+        ?.filter((draft): draft is { id: string; message: { id: string; threadId: string } } =>
+          !!draft.id && !!draft.message?.id && !!draft.message.threadId)
+        .map(draft => ({
+          id: draft.id,
+          message: { id: draft.message.id, threadId: draft.message.threadId },
+        })),
+      ...(response.nextPageToken ? { nextPageToken: response.nextPageToken } : {}),
+    };
+  }
+
   async createDraft(raw: string, threadId?: string): Promise<{ id: string; message: { id: string; threadId: string } }> {
     const message = threadId ? { raw, threadId } : { raw };
     return requireDraft(

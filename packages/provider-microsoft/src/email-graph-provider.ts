@@ -11,6 +11,7 @@ import type {
   EmailError,
   ListOptions,
   ReplyOptions,
+  ForwardOptions,
   EmailReader,
   EmailSender,
   EmailCategorizer,
@@ -26,6 +27,7 @@ import type {
   EmailScheduledSender,
   DraftReplyStatus,
   SearchProviderOptions,
+  DraftLookupResult,
 } from '@usejunior/email-core';
 import { AttachmentNotSupportedError, AttachmentNotFoundError, ProviderError } from '@usejunior/email-core';
 import { MAX_READ_ATTEMPTS, readRetryDelayMs } from './throttle.js';
@@ -899,6 +901,7 @@ export class GraphEmailProvider implements EmailReader, EmailSender, EmailSchedu
       bccRecipients: toGraphRecipients(msg.bcc),
       singleValueExtendedProperties: [
         { id: DRAFT_ORIGIN_PROPERTY, value: 'non_reply' },
+        ...(msg.trackingId ? [{ id: TRACKING_PROPERTY, value: msg.trackingId }] : []),
       ],
     };
     if (msg.attachments && msg.attachments.length > 0) {
@@ -1033,11 +1036,30 @@ export class GraphEmailProvider implements EmailReader, EmailSender, EmailSchedu
     if (candidate.isDraft !== true || !findDeferredSendProperty(candidate)) {
       throw scheduledSendNotFoundError();
     }
+    // Try a move to Deleted Items first, then DELETE. Live canaries show Graph
+    // locks a submitted deferred-send draft: the move is refused (400/403, or
+    // 500 ErrorMoveCopyFailed) and DELETE destroys the item (absent from
+    // Deleted Items, Drafts, Outbox and Sent Items). Cancel is therefore
+    // destructive in practice; the move stays only in case a tenant allows it.
+    // Any other 500 rethrows so a transient fault never destroys a draft.
+    // Do not invent a reschedule path: PATCHing the deferred time returns 403.
     try {
-      await this.client.delete(`${this.basePath}/messages/${encodedId}`);
+      await this.moveToFolder(messageId, 'deleteditems');
     } catch (err) {
       if (err instanceof GraphApiError && err.status === 404) {
         throw scheduledSendNotFoundError();
+      }
+      if (err instanceof GraphApiError && (err.status === 400 || err.status === 403
+        || (err.status === 500 && /ErrorMoveCopyFailed/.test(err.message ?? '')))) {
+        try {
+          await this.client.delete(`${this.basePath}/messages/${encodedId}`);
+        } catch (deleteErr) {
+          if (deleteErr instanceof GraphApiError && deleteErr.status === 404) {
+            throw scheduledSendNotFoundError();
+          }
+          throw deleteErr;
+        }
+        return;
       }
       throw err;
     }
@@ -1054,6 +1076,21 @@ export class GraphEmailProvider implements EmailReader, EmailSender, EmailSchedu
         return { success: false, draftId: err.draftId, error: err.emailError };
       }
       const message = err instanceof Error ? err.message : 'Failed to create reply draft';
+      return { success: false, error: { code: 'DRAFT_FAILED', message, recoverable: false } };
+    }
+  }
+
+  async createForwardDraft(messageId: string, opts: ForwardOptions): Promise<DraftResult> {
+    // POST /createForward then PATCH recipients and comment. Never send — forwarding
+    // and sending stay separate actions. Graph preserves conversationId on the draft.
+    try {
+      const draftId = await this.prepareForwardDraft(messageId, opts);
+      return { success: true, draftId };
+    } catch (err) {
+      if (err instanceof GraphAttachmentError) {
+        return { success: false, draftId: err.draftId, error: err.emailError };
+      }
+      const message = err instanceof Error ? err.message : 'Failed to create forward draft';
       return { success: false, error: { code: 'DRAFT_FAILED', message, recoverable: false } };
     }
   }
@@ -1123,6 +1160,7 @@ export class GraphEmailProvider implements EmailReader, EmailSender, EmailSchedu
       body: { contentType: 'HTML', content: truncateBody(merged) },
       singleValueExtendedProperties: [
         { id: DRAFT_ORIGIN_PROPERTY, value: 'reply' },
+        ...(opts?.trackingId ? [{ id: TRACKING_PROPERTY, value: opts.trackingId }] : []),
       ],
     };
 
@@ -1145,6 +1183,68 @@ export class GraphEmailProvider implements EmailReader, EmailSender, EmailSchedu
           {
             code: 'ATTACHMENT_UPLOAD_FAILED',
             message: `Reply draft was created but attaching files failed: ${err instanceof Error ? err.message : String(err)}`,
+            recoverable: false,
+          },
+          draft.id,
+        );
+      }
+    }
+
+    return draft.id;
+  }
+
+  /**
+   * POST /createForward (empty body), then PATCH comment/body and recipients.
+   * Never calls /send. Caller-supplied attachments are POSTed onto the draft
+   * after the PATCH, matching the reply two-step upload.
+   */
+  private async prepareForwardDraft(messageId: string, opts: ForwardOptions): Promise<string> {
+    const sizeError = checkGraphAttachmentLimits(opts.attachments, { checkTotal: false });
+    if (sizeError) {
+      throw new GraphAttachmentError(sizeError);
+    }
+
+    const draft = await this.client.post(
+      `${this.basePath}/messages/${encodeGraphPathId(messageId)}/createForward`,
+      {},
+    );
+    if (!draft.id) throw new Error('createForward did not return a draft id');
+
+    let draftBody = draft.body as { contentType?: string; content?: string } | undefined;
+    if (typeof draftBody?.content !== 'string' || draftBody.contentType?.toLowerCase() !== 'html') {
+      const fetched = await this.client.get(`${this.basePath}/messages/${encodeGraphPathId(draft.id)}`);
+      draftBody = fetched.body as { contentType?: string; content?: string } | undefined;
+    }
+
+    const draftContent = typeof draftBody?.content === 'string' ? draftBody.content : '';
+    const hasComment = (opts.bodyHtml !== undefined && opts.bodyHtml.length > 0)
+      || (opts.comment !== undefined && opts.comment.length > 0);
+    const patch: Record<string, unknown> = {
+      toRecipients: toGraphRecipients(opts.to),
+      singleValueExtendedProperties: [
+        { id: DRAFT_ORIGIN_PROPERTY, value: 'reply' },
+      ],
+    };
+    if (opts.cc && opts.cc.length > 0) {
+      patch.ccRecipients = toGraphRecipients(opts.cc);
+    }
+    if (hasComment) {
+      const callerFragment = opts.bodyHtml !== undefined
+        ? stripHtmlBodyWrappers(opts.bodyHtml)
+        : wrapPlainTextAsHtml(opts.comment ?? '');
+      patch.body = { contentType: 'HTML', content: truncateBody(mergeQuotedReplyHtml(draftContent, callerFragment)) };
+    }
+
+    await this.client.patch(`${this.basePath}/messages/${encodeGraphPathId(draft.id)}`, patch);
+
+    if (opts.attachments && opts.attachments.length > 0) {
+      try {
+        await this.postDraftAttachments(draft.id, opts.attachments);
+      } catch (err) {
+        throw new GraphAttachmentError(
+          {
+            code: 'ATTACHMENT_UPLOAD_FAILED',
+            message: `Forward draft was created but attaching files failed: ${err instanceof Error ? err.message : String(err)}`,
             recoverable: false,
           },
           draft.id,
@@ -1240,6 +1340,134 @@ export class GraphEmailProvider implements EmailReader, EmailSender, EmailSchedu
     }
 
     return { success: true, draftId };
+  }
+
+  /**
+   * Confirm the id is a live draft before mutating its attachment collection.
+   * Sent mail must not grow or lose attachments through these paths.
+   */
+  private async requireDraft(draftId: string): Promise<EmailError | null> {
+    try {
+      const message = await this.client.get(
+        `${this.basePath}/messages/${encodeGraphPathId(draftId)}?$select=id,isDraft`,
+      ) as unknown as GraphMessage;
+      if (message.isDraft !== true) {
+        return {
+          code: 'NOT_A_DRAFT',
+          message: `Message ${draftId} is not a draft`,
+          recoverable: false,
+        };
+      }
+      return null;
+    } catch (err) {
+      if (err instanceof GraphApiError && err.status === 404) {
+        return {
+          code: 'DRAFT_NOT_FOUND',
+          message: `Draft not found: ${draftId}`,
+          recoverable: false,
+        };
+      }
+      throw err;
+    }
+  }
+
+  async addDraftAttachments(draftId: string, attachments: OutboundAttachment[]): Promise<DraftResult> {
+    const sizeError = checkGraphAttachmentLimits(attachments, { checkTotal: false });
+    if (sizeError) {
+      return { success: false, draftId, error: sizeError };
+    }
+    const draftError = await this.requireDraft(draftId);
+    if (draftError) {
+      return { success: false, draftId, error: draftError };
+    }
+    try {
+      await this.postDraftAttachments(draftId, attachments);
+      return { success: true, draftId };
+    } catch (err) {
+      return {
+        success: false,
+        draftId,
+        error: {
+          code: 'ATTACHMENT_UPLOAD_FAILED',
+          message: `Draft ${draftId} exists, but adding attachments failed: ${err instanceof Error ? err.message : String(err)}`,
+          recoverable: false,
+        },
+      };
+    }
+  }
+
+  async removeDraftAttachments(draftId: string, attachmentIds: string[]): Promise<DraftResult> {
+    const draftError = await this.requireDraft(draftId);
+    if (draftError) {
+      return { success: false, draftId, error: draftError };
+    }
+
+    const existing = await this.listAttachments(draftId);
+    const named = [...new Set(attachmentIds)];
+    const existingIds = new Set(existing.map(attachment => attachment.id));
+    const missing = named.filter(id => !existingIds.has(id));
+    if (missing.length > 0) {
+      return {
+        success: false,
+        draftId,
+        error: {
+          code: 'ATTACHMENT_NOT_FOUND',
+          message: `Attachment not found on draft ${draftId}: ${missing.join(', ')}`,
+          recoverable: false,
+        },
+      };
+    }
+
+    try {
+      for (const attachmentId of named) {
+        await this.client.delete(
+          `${this.basePath}/messages/${encodeGraphPathId(draftId)}/attachments/${encodeGraphPathId(attachmentId)}`,
+        );
+      }
+      return { success: true, draftId };
+    } catch (err) {
+      return {
+        success: false,
+        draftId,
+        error: {
+          code: 'ATTACHMENT_UPDATE_FAILED',
+          message: `Draft ${draftId} was verified, but removing attachments failed: ${err instanceof Error ? err.message : String(err)}`,
+          recoverable: false,
+        },
+      };
+    }
+  }
+
+  async findDraftByTrackingId(trackingId: string): Promise<DraftLookupResult | null> {
+    const escaped = trackingId.replace(/'/g, "''");
+    const filter = `singleValueExtendedProperties/Any(ep: ep/id eq '${TRACKING_PROPERTY}' and ep/value eq '${escaped}')`;
+    const propertyFilter = `$filter=id eq '${TRACKING_PROPERTY}'`;
+    const url = `${this.basePath}/mailFolders/drafts/messages`
+      + `?$filter=${encodeURIComponent(filter)}`
+      + `&$select=id,isDraft`
+      + `&$expand=singleValueExtendedProperties(${propertyFilter})`
+      + `&$top=10`;
+    const response = await this.client.get(url) as GraphMessagePageResponse;
+    const matches: DraftLookupResult[] = [];
+    for (const message of response.value ?? []) {
+      if (message.isDraft !== true) continue;
+      const stamps = (message.singleValueExtendedProperties ?? []).filter(
+        property => property.id.toLowerCase() === TRACKING_PROPERTY.toLowerCase(),
+      );
+      if (stamps.length === 0) continue;
+      if (!stamps.every(property => property.value === trackingId)) continue;
+      matches.push({ draftId: message.id, messageId: message.id });
+    }
+    if (matches.length === 0) return null;
+    if (matches.length > 1) {
+      throw new ProviderError(
+        'TRACKING_ID_AMBIGUOUS',
+        `Multiple drafts share tracking_id ${trackingId}`,
+        'microsoft',
+        false,
+      );
+    }
+    return matches[0]!;
   }
 
   /**

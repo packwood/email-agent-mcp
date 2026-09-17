@@ -44,12 +44,34 @@ export function checkMailboxRequired(
   return null;
 }
 
+// --- tracking_id ---
+
+/** Exact-match tracking ids only. Rejects empty, whitespace, and header/OData metacharacters. */
+export const TRACKING_ID_PATTERN = /^[A-Za-z0-9._:-]{1,128}$/;
+
+export function parseTrackingId(
+  value: string | undefined,
+): { trackingId?: string } | { error: ActionError } {
+  if (value === undefined) return {};
+  if (!TRACKING_ID_PATTERN.test(value)) {
+    return {
+      error: {
+        code: 'INVALID_TRACKING_ID',
+        message: 'tracking_id must be 1-128 characters of A-Z, a-z, 0-9, ".", "_", ":", or "-" and is matched exactly on lookup',
+        recoverable: false,
+      },
+    };
+  }
+  return { trackingId: value };
+}
+
 // --- resolveComposeFields ---
 
 export interface ComposeFields {
   body: string;
   to?: string | string[];
   cc?: string[];
+  bcc?: string[];
   subject?: string;
   replyTo?: string;
   draft?: boolean;
@@ -71,6 +93,7 @@ export async function resolveComposeFields(
     body_file?: string;
     to?: string | string[];
     cc?: string[];
+    bcc?: string[];
     subject?: string;
     reply_to?: string;
     draft?: boolean;
@@ -83,6 +106,7 @@ export async function resolveComposeFields(
   let body: string | undefined;
   let to = input.to;
   let cc = input.cc;
+  let bcc = input.bcc;
   let subject = input.subject;
   let replyTo = input.reply_to;
   let draft = input.draft;
@@ -101,6 +125,7 @@ export async function resolveComposeFields(
       const fm = bodyResult.frontmatter;
       if (fm.to !== undefined) to = fm.to;
       if (fm.cc !== undefined) cc = Array.isArray(fm.cc) ? fm.cc : [fm.cc];
+      if (fm.bcc !== undefined) bcc = Array.isArray(fm.bcc) ? fm.bcc : [fm.bcc];
       if (fm.subject !== undefined) subject = fm.subject;
       if (fm.reply_to !== undefined) replyTo = fm.reply_to;
       if (fm.draft !== undefined) draft = fm.draft;
@@ -116,7 +141,7 @@ export async function resolveComposeFields(
     };
   }
 
-  return { body: body ?? '', to, cc, subject, replyTo, draft, format, forceBlack };
+  return { body: body ?? '', to, cc, bcc, subject, replyTo, draft, format, forceBlack };
 }
 
 // --- Outbound attachments ---
@@ -266,10 +291,10 @@ export function checkRateLimit(
 // --- parseRecipients ---
 
 export type ParsedRecipients =
-  | { to: EmailAddress[]; cc: EmailAddress[] }
+  | { to: EmailAddress[]; cc: EmailAddress[]; bcc: EmailAddress[] }
   | { error: ActionError };
 
-export function parseRecipients(input: { to?: string[]; cc?: string[] }): ParsedRecipients {
+export function parseRecipients(input: { to?: string[]; cc?: string[]; bcc?: string[] }): ParsedRecipients {
   const toResult = parseAddressList(input.to, 'to');
   if (!toResult.ok) {
     return {
@@ -290,7 +315,17 @@ export function parseRecipients(input: { to?: string[]; cc?: string[] }): Parsed
       },
     };
   }
-  return { to: toResult.addresses, cc: ccResult.addresses };
+  const bccResult = parseAddressList(input.bcc, 'bcc');
+  if (!bccResult.ok) {
+    return {
+      error: {
+        code: 'INVALID_ADDRESS',
+        message: `${bccResult.field}[${bccResult.index}] invalid address: "${bccResult.value}"`,
+        recoverable: false,
+      },
+    };
+  }
+  return { to: toResult.addresses, cc: ccResult.addresses, bcc: bccResult.addresses };
 }
 
 // --- Draft preview ---

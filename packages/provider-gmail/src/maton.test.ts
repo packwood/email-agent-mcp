@@ -133,6 +133,28 @@ describe('MatonGmailApiClient', () => {
     });
   });
 
+  it('lists drafts with maxResults and pageToken', async () => {
+    const fetchMock = vi.fn(async () => new Response(
+      JSON.stringify({
+        drafts: [{ id: 'd-1', message: { id: 'm-draft', threadId: 't-1' } }],
+        nextPageToken: 'page-2',
+      }),
+      { status: 200 },
+    ));
+    vi.stubGlobal('fetch', fetchMock);
+    const client = new MatonGmailApiClient('secret-key', 'connection-1', 1000, 0);
+
+    await expect(client.listDrafts({ maxResults: 25, pageToken: 'page-1' })).resolves.toEqual({
+      drafts: [{ id: 'd-1', message: { id: 'm-draft', threadId: 't-1' } }],
+      nextPageToken: 'page-2',
+    });
+    const parsed = new URL(String(fetchMock.mock.calls[0]![0]));
+    expect(parsed.pathname).toContain('/users/me/drafts');
+    expect(parsed.searchParams.get('maxResults')).toBe('25');
+    expect(parsed.searchParams.get('pageToken')).toBe('page-1');
+    expect(fetchMock.mock.calls[0]![1].method).toBe('GET');
+  });
+
   it('does not retry failed mutations or expose credentials echoed by an upstream error', async () => {
     const fetchMock = vi.fn(async () => new Response(
       'upstream unavailable for secret-key and connection-1',

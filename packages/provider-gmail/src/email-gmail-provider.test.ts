@@ -2,8 +2,12 @@ import { describe, it, expect, vi } from 'vitest';
 import { GmailEmailProvider, type GmailApiClient } from './email-gmail-provider.js';
 import {
   AttachmentNotFoundError,
+  addDraftAttachmentsAction,
   cancelScheduledSendAction,
+  deleteEmailAction,
   listScheduledSendsAction,
+  moveToFolderAction,
+  removeDraftAttachmentsAction,
   sendDraftAction,
   sendEmailAction,
   type EmailScheduledSender,
@@ -370,6 +374,137 @@ describe('provider-gmail/Label Mapping', () => {
   });
 });
 
+describe('provider-gmail/Move and Trash', () => {
+  function labeledMessage(labelIds: string[]) {
+    return {
+      id: 'msg-1',
+      threadId: 'thread-1',
+      labelIds,
+      payload: {
+        headers: [
+          { name: 'From', value: 'alice@corp.com' },
+          { name: 'To', value: 'bob@corp.com' },
+          { name: 'Subject', value: 'Move me' },
+        ],
+      },
+      internalDate: String(Date.now()),
+    };
+  }
+
+  it('Scenario: moveToFolder maps inbox to archive by removing INBOX', async () => {
+    const client = createMockGmailClient({
+      getMessage: vi.fn().mockResolvedValue(labeledMessage(['INBOX', 'UNREAD'])),
+    });
+    const provider = new GmailEmailProvider(client);
+
+    const newId = await provider.moveToFolder('msg-1', 'archive');
+
+    expect(newId).toBe('msg-1');
+    expect(client.modifyMessage).toHaveBeenCalledWith('msg-1', {
+      addLabelIds: [],
+      removeLabelIds: ['INBOX'],
+    });
+  });
+
+  it('Scenario: moveToFolder maps trash via the well-known TRASH label', async () => {
+    const client = createMockGmailClient({
+      getMessage: vi.fn().mockResolvedValue(labeledMessage(['INBOX'])),
+    });
+    const provider = new GmailEmailProvider(client);
+
+    await provider.moveToFolder('msg-1', 'trash');
+
+    expect(client.modifyMessage).toHaveBeenCalledWith('msg-1', {
+      addLabelIds: ['TRASH'],
+      removeLabelIds: ['INBOX'],
+    });
+  });
+
+  it('Scenario: moveToFolder accepts Graph-style deleteditems alias', async () => {
+    const client = createMockGmailClient({
+      getMessage: vi.fn().mockResolvedValue(labeledMessage(['INBOX'])),
+    });
+    const provider = new GmailEmailProvider(client);
+
+    await provider.moveToFolder('msg-1', 'deleteditems');
+
+    expect(client.modifyMessage).toHaveBeenCalledWith('msg-1', {
+      addLabelIds: ['TRASH'],
+      removeLabelIds: ['INBOX'],
+    });
+  });
+
+  it('Scenario: moveToFolder to a custom label removes INBOX', async () => {
+    const client = createMockGmailClient({
+      getMessage: vi.fn().mockResolvedValue(labeledMessage(['INBOX'])),
+    });
+    const provider = new GmailEmailProvider(client);
+
+    await provider.moveToFolder('msg-1', 'Label_42');
+
+    expect(client.modifyMessage).toHaveBeenCalledWith('msg-1', {
+      addLabelIds: ['Label_42'],
+      removeLabelIds: ['INBOX'],
+    });
+  });
+
+  it('Scenario: deleteMessage applies TRASH and never calls messages.delete', async () => {
+    const client = createMockGmailClient({
+      getMessage: vi.fn().mockResolvedValue(labeledMessage(['INBOX'])),
+    });
+    const provider = new GmailEmailProvider(client);
+
+    await provider.deleteMessage('msg-1');
+    await provider.deleteMessage('msg-1', true);
+
+    expect(client.modifyMessage).toHaveBeenCalledTimes(2);
+    expect(client.modifyMessage).toHaveBeenNthCalledWith(1, 'msg-1', {
+      addLabelIds: ['TRASH'],
+      removeLabelIds: ['INBOX'],
+    });
+    expect(client.modifyMessage).toHaveBeenNthCalledWith(2, 'msg-1', {
+      addLabelIds: ['TRASH'],
+      removeLabelIds: ['INBOX'],
+    });
+    expect(client).not.toHaveProperty('deleteMessage');
+    expect(Object.keys(client)).not.toContain('delete');
+  });
+
+  it('Scenario: move_to_folder action succeeds on Gmail', async () => {
+    const client = createMockGmailClient({
+      getMessage: vi.fn().mockResolvedValue(labeledMessage(['INBOX'])),
+    });
+    const provider = new GmailEmailProvider(client);
+
+    const result = await moveToFolderAction.run({ provider }, { id: 'msg-1', folder: 'junk' });
+
+    expect(result.success).toBe(true);
+    expect(result.newId).toBe('msg-1');
+    expect(client.modifyMessage).toHaveBeenCalledWith('msg-1', {
+      addLabelIds: ['SPAM'],
+      removeLabelIds: ['INBOX'],
+    });
+  });
+
+  it('Scenario: delete_email soft-delete on Gmail uses TRASH', async () => {
+    const client = createMockGmailClient({
+      getMessage: vi.fn().mockResolvedValue(labeledMessage(['INBOX'])),
+    });
+    const provider = new GmailEmailProvider(client);
+
+    const result = await deleteEmailAction.run(
+      { provider, deleteEnabled: true, hardDeleteAllowed: false },
+      { id: 'msg-1', user_explicitly_requested_deletion: true, hard_delete: false },
+    );
+
+    expect(result.success).toBe(true);
+    expect(client.modifyMessage).toHaveBeenCalledWith('msg-1', {
+      addLabelIds: ['TRASH'],
+      removeLabelIds: ['INBOX'],
+    });
+  });
+});
+
 describe('provider-gmail/Pagination', () => {
   it('bounds concurrent Gmail detail reads at ten', async () => {
     let active = 0;
@@ -477,6 +612,80 @@ describe('provider-gmail/Draft Operations', () => {
     expect(client.createDraft).toHaveBeenCalledWith(expect.any(String), undefined);
     const raw = lastRaw(client.createDraft as ReturnType<typeof vi.fn>);
     expect(raw).toContain('X-Agent-Draft-Origin: non_reply');
+    expect(raw).not.toContain('X-Agent-Email-Tracking-Id:');
+  });
+
+  it('createDraft writes X-Agent-Email-Tracking-Id when trackingId is supplied', async () => {
+    const client = createMockGmailClient();
+    const provider = new GmailEmailProvider(client);
+
+    await provider.createDraft({
+      to: [{ email: 'bob@corp.com' }],
+      subject: 'Tracked',
+      body: 'Hello',
+      trackingId: 'create-timeout-1',
+    });
+
+    const raw = lastRaw(client.createDraft as ReturnType<typeof vi.fn>);
+    expect(raw).toContain('X-Agent-Email-Tracking-Id: create-timeout-1');
+  });
+
+  it('findDraftByTrackingId returns only an exact header match', async () => {
+    const client = createMockGmailClient({
+      listDrafts: vi.fn().mockResolvedValue({
+        drafts: [
+          { id: 'draft-prefix', message: { id: 'msg-prefix', threadId: 't-1' } },
+          { id: 'draft-exact', message: { id: 'msg-exact', threadId: 't-2' } },
+        ],
+      }),
+      getDraft: vi.fn(async (id: string) => {
+        if (id === 'draft-exact') {
+          return {
+            id: 'draft-exact',
+            message: {
+              id: 'msg-exact',
+              threadId: 't-2',
+              labelIds: ['DRAFT'],
+              payload: {
+                headers: [
+                  { name: 'X-Agent-Email-Tracking-Id', value: 'track-100' },
+                  { name: 'Subject', value: 'Exact' },
+                ],
+              },
+            },
+          };
+        }
+        return {
+          id: 'draft-prefix',
+          message: {
+            id: 'msg-prefix',
+            threadId: 't-1',
+            labelIds: ['DRAFT'],
+            payload: {
+              headers: [
+                { name: 'X-Agent-Email-Tracking-Id', value: 'track-1000' },
+                { name: 'Subject', value: 'Neighbor' },
+              ],
+            },
+          },
+        };
+      }),
+    });
+    const provider = new GmailEmailProvider(client);
+
+    await expect(provider.findDraftByTrackingId('track-100')).resolves.toEqual({
+      draftId: 'draft-exact',
+      messageId: 'msg-exact',
+    });
+    await expect(provider.findDraftByTrackingId('track-10')).resolves.toBeNull();
+  });
+
+  it('findDraftByTrackingId fails closed without drafts.list', async () => {
+    const client = createMockGmailClient();
+    delete (client as { listDrafts?: unknown }).listDrafts;
+    const provider = new GmailEmailProvider(client);
+    await expect(provider.findDraftByTrackingId('any-id'))
+      .rejects.toMatchObject({ code: 'NOT_SUPPORTED' });
   });
 
   it('Scenario: sendDraft calls Gmail API with draft ID', async () => {
@@ -561,6 +770,44 @@ describe('email-write/Unsupported Scheduled Send Providers', () => {
       expect(client.getMessage).not.toHaveBeenCalled();
       expect(client.sendDraft).not.toHaveBeenCalled();
     });
+  });
+});
+
+describe('provider-gmail/Attachment-Level Draft Mutations Are Explicitly Unsupported', () => {
+  it('Scenario: Gmail has no attachment-level API and names the wholesale-replace alternative', async () => {
+    const client = createMockGmailClient();
+    const provider = new GmailEmailProvider(client);
+    const mutating = provider as unknown as {
+      addDraftAttachments?: unknown;
+      removeDraftAttachments?: unknown;
+    };
+
+    const added = await addDraftAttachmentsAction.run({ provider }, {
+      draft_id: 'draft-abc',
+      attachments: [{ base64: Buffer.from('%PDF-1.4').toString('base64'), filename: 'note.pdf' }],
+    });
+    const removed = await removeDraftAttachmentsAction.run({ provider }, {
+      draft_id: 'draft-abc',
+      attachment_ids: ['att-1'],
+    });
+
+    expect(mutating.addDraftAttachments).toBeUndefined();
+    expect(mutating.removeDraftAttachments).toBeUndefined();
+    expect(added).toMatchObject({
+      success: false,
+      error: { code: 'NOT_SUPPORTED', recoverable: false },
+    });
+    expect(added.error?.message).toContain('update_draft');
+    expect(added.error?.message).toContain('attachments');
+    expect(removed).toMatchObject({
+      success: false,
+      error: { code: 'NOT_SUPPORTED', recoverable: false },
+    });
+    expect(client.createDraft).not.toHaveBeenCalled();
+    expect(client.updateDraft).not.toHaveBeenCalled();
+    expect(client.sendDraft).not.toHaveBeenCalled();
+    expect(client.sendMessage).not.toHaveBeenCalled();
+    expect(client.getDraft).not.toHaveBeenCalled();
   });
 });
 
@@ -963,6 +1210,20 @@ describe('provider-gmail/Reply Drafts', () => {
     expect(raw).toContain('Thanks for the update.');
   });
 
+  it('createReplyDraft writes X-Agent-Email-Tracking-Id when trackingId is supplied', async () => {
+    const client = createMockGmailClient({
+      getMessage: vi.fn().mockResolvedValue(originalMessageMock()),
+    });
+    const provider = new GmailEmailProvider(client);
+
+    await provider.createReplyDraft('msg-original', 'Thanks', {
+      trackingId: 'reply-timeout-1',
+    });
+
+    const raw = lastRaw(client.createDraft as ReturnType<typeof vi.fn>);
+    expect(raw).toContain('X-Agent-Email-Tracking-Id: reply-timeout-1');
+  });
+
   it('Scenario: subject prefixed with Re: is not double-prefixed', async () => {
     const already = {
       ...originalMessageMock(),
@@ -1047,6 +1308,136 @@ describe('provider-gmail/Reply Drafts', () => {
 
     const raw = lastRaw(client.createDraft as ReturnType<typeof vi.fn>);
     expect(raw).toMatch(/Cc: .*bob@corp\.com.*carol@corp\.com/);
+  });
+});
+
+describe('provider-gmail/Forward Drafts', () => {
+  function originalMessageMock() {
+    return {
+      id: 'msg-original',
+      threadId: 'thread-abc',
+      labelIds: ['INBOX'],
+      payload: {
+        headers: [
+          { name: 'From', value: '"Alice" <alice@corp.com>' },
+          { name: 'To', value: 'bob@corp.com' },
+          { name: 'Subject', value: 'Original thread' },
+          { name: 'Date', value: '2026-01-15T10:00:00Z' },
+          { name: 'Message-ID', value: '<msg-a@corp.com>' },
+          { name: 'References', value: '<msg-r1@corp.com>' },
+        ],
+        body: { data: Buffer.from('Original body').toString('base64url') },
+        mimeType: 'text/plain',
+      },
+      internalDate: String(new Date('2026-01-15T10:00:00Z').getTime()),
+    };
+  }
+
+  it('Scenario: createForwardDraft quotes the original in the source thread without sending', async () => {
+    const client = createMockGmailClient({
+      getMessage: vi.fn().mockResolvedValue(originalMessageMock()),
+    });
+    const provider = new GmailEmailProvider(client);
+
+    const result = await provider.createForwardDraft('msg-original', {
+      to: [{ email: 'dave@corp.com', name: 'Dave' }],
+      cc: [{ email: 'erin@corp.com' }],
+      comment: 'Please review',
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.draftId).toBe('draft-abc');
+    expect(client.createDraft).toHaveBeenCalledWith(expect.any(String), 'thread-abc');
+    expect(client.sendMessage).not.toHaveBeenCalled();
+    expect(client.sendDraft).not.toHaveBeenCalled();
+
+    const raw = lastRaw(client.createDraft as ReturnType<typeof vi.fn>);
+    expect(raw).toContain('To: "Dave" <dave@corp.com>');
+    expect(raw).toContain('Cc: erin@corp.com');
+    expect(raw).toContain('Subject: Fwd: Original thread');
+    expect(raw).toContain('X-Agent-Draft-Origin: reply');
+    expect(raw).toContain('In-Reply-To: <msg-a@corp.com>');
+    expect(raw).toContain('References: <msg-r1@corp.com> <msg-a@corp.com>');
+    expect(raw).toContain('Please review');
+    expect(raw).toContain('---------- Forwarded message ---------');
+    expect(raw).toContain('Original body');
+  });
+
+  it('Scenario: subject prefixed with Fwd: is not double-prefixed', async () => {
+    const already = {
+      ...originalMessageMock(),
+      payload: {
+        ...originalMessageMock().payload,
+        headers: [
+          ...originalMessageMock().payload.headers.filter(h => h.name !== 'Subject'),
+          { name: 'Subject', value: 'Fwd: Original thread' },
+        ],
+      },
+    };
+    const client = createMockGmailClient({
+      getMessage: vi.fn().mockResolvedValue(already),
+    });
+    const provider = new GmailEmailProvider(client);
+
+    await provider.createForwardDraft('msg-original', {
+      to: [{ email: 'dave@corp.com' }],
+    });
+
+    const raw = lastRaw(client.createDraft as ReturnType<typeof vi.fn>);
+    expect(raw).toContain('Subject: Fwd: Original thread');
+    expect(raw).not.toContain('Subject: Fwd: Fwd:');
+  });
+
+  it('Scenario: createForwardDraft reattaches original attachments', async () => {
+    const withAtt = {
+      ...originalMessageMock(),
+      payload: {
+        ...originalMessageMock().payload,
+        mimeType: 'multipart/mixed',
+        body: undefined,
+        parts: [
+          {
+            mimeType: 'text/plain',
+            body: { data: Buffer.from('Original body').toString('base64url') },
+          },
+          {
+            filename: 'report.pdf',
+            mimeType: 'application/pdf',
+            body: { attachmentId: 'att-1', size: 16 },
+          },
+        ],
+      },
+    };
+    const client = createMockGmailClient({
+      getMessage: vi.fn().mockResolvedValue(withAtt),
+    });
+    const provider = new GmailEmailProvider(client);
+
+    const result = await provider.createForwardDraft('msg-original', {
+      to: [{ email: 'dave@corp.com' }],
+    });
+
+    expect(result.success).toBe(true);
+    expect(client.getAttachment).toHaveBeenCalledWith('msg-original', 'att-1');
+    const raw = lastRaw(client.createDraft as ReturnType<typeof vi.fn>);
+    expect(raw).toContain('filename="report.pdf"');
+  });
+
+  it('Scenario: createForwardDraft returns structured DRAFT_FAILED on error', async () => {
+    const client = createMockGmailClient({
+      getMessage: vi.fn().mockResolvedValue(originalMessageMock()),
+      createDraft: vi.fn().mockRejectedValue(new Error('quota exceeded')),
+    });
+    const provider = new GmailEmailProvider(client);
+
+    const result = await provider.createForwardDraft('msg-original', {
+      to: [{ email: 'dave@corp.com' }],
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.error?.code).toBe('DRAFT_FAILED');
+    expect(result.error?.message).toMatch(/quota exceeded/);
+    expect(client.sendMessage).not.toHaveBeenCalled();
   });
 });
 

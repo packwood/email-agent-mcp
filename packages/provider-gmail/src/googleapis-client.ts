@@ -44,6 +44,11 @@ interface GmailDraft {
 }
 
 interface GmailDraftsApi {
+  list(args: {
+    userId: string;
+    maxResults?: number;
+    pageToken?: string;
+  }): Promise<{ data?: { drafts?: GmailDraft[]; nextPageToken?: string | null } }>;
   create(args: {
     userId: string;
     requestBody: { message: { raw: string; threadId?: string } };
@@ -259,6 +264,28 @@ export class GoogleapisGmailClient implements GmailApiClient {
     return {
       id: response.data.id,
       messages: response.data.messages,
+    };
+  }
+
+  async listDrafts(opts: { maxResults?: number; pageToken?: string } = {}): Promise<{
+    drafts?: Array<{ id: string; message: { id: string; threadId: string } }>;
+    nextPageToken?: string;
+  }> {
+    const response = await this.api.users.drafts.list({
+      userId: 'me',
+      maxResults: opts.maxResults,
+      ...(opts.pageToken ? { pageToken: opts.pageToken } : {}),
+    });
+
+    return {
+      drafts: response.data?.drafts
+        ?.filter((draft): draft is { id: string; message: { id: string; threadId: string } } =>
+          !!draft.id && !!draft.message?.id && !!draft.message.threadId)
+        .map(draft => ({
+          id: draft.id,
+          message: { id: draft.message.id, threadId: draft.message.threadId },
+        })),
+      ...(response.data?.nextPageToken ? { nextPageToken: response.data.nextPageToken } : {}),
     };
   }
 

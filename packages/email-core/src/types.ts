@@ -155,6 +155,31 @@ export interface ReplyOptions {
    * historical reply-all default.
    */
   replyAll?: boolean;
+  /**
+   * Caller-supplied tracking id, written onto the reply/draft so a timed-out
+   * create can be reconciled by exact lookup instead of retried.
+   */
+  trackingId?: string;
+}
+
+export interface ForwardOptions {
+  to: EmailAddress[];
+  cc?: EmailAddress[];
+  /**
+   * Plain-text forward comment. Ignored when `bodyHtml` is set.
+   */
+  comment?: string;
+  /**
+   * Pre-rendered HTML comment inserted above the quoted original. When set,
+   * providers use this instead of `comment`.
+   */
+  bodyHtml?: string;
+  attachments?: OutboundAttachment[];
+}
+
+export interface DraftLookupResult {
+  draftId: string;
+  messageId: string;
 }
 
 export interface Subscription {
