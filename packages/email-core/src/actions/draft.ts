@@ -4,7 +4,7 @@ import { createHash } from 'node:crypto';
 import type { ActionContext, EmailAction } from './registry.js';
 import { checkSendAllowlist } from '../security/send-allowlist.js';
 import { checkReplyThreading } from '../security/reply-validation.js';
-import { withRetry } from '../providers/provider.js';
+import { withRetry, type DraftReplyStatus } from '../providers/provider.js';
 import { truncateBody, BODY_SIZE_LIMIT } from '../content/body-loader.js';
 import { renderEmailBody } from '../content/body-renderer.js';
 import {
@@ -441,6 +441,7 @@ const InspectDraftExactOutput = z.object({
     isInline: z.boolean(),
     sha256: z.string(),
   })),
+  replyStatus: z.enum(['reply', 'non_reply', 'indeterminate']).optional(),
 });
 
 const MAX_APPROVAL_ATTACHMENT_BYTES = 25 * 1024 * 1024;
@@ -501,6 +502,17 @@ export const inspectDraftExactAction: EmailAction<
     attachments.sort((a, b) =>
       `${a.filename}\0${a.id}`.localeCompare(`${b.filename}\0${b.id}`),
     );
+
+    let replyStatus: DraftReplyStatus | undefined;
+    if (ctx.provider.getDraftReplyStatus) {
+      try {
+        replyStatus = await ctx.provider.getDraftReplyStatus(input.draft_id);
+      } catch {
+        // Reply metadata must never fail an otherwise successful inspect.
+        replyStatus = 'indeterminate';
+      }
+    }
+
     return {
       draftId: input.draft_id,
       messageId: message.id,
@@ -512,6 +524,7 @@ export const inspectDraftExactAction: EmailAction<
       bodyHtml: message.bodyHtml ?? '',
       threadId: message.threadId ?? message.conversationId ?? '',
       attachments,
+      ...(replyStatus !== undefined ? { replyStatus } : {}),
     };
   },
 };

@@ -161,6 +161,75 @@ describe('email-write/Inspect Draft Exact', () => {
       draft_id: 'draft-oversized',
     })).rejects.toThrow('Attachment exceeds approval fingerprint limit');
   });
+
+  it.each(['reply', 'non_reply', 'indeterminate'] as const)(
+    'reports replyStatus %s from the provider',
+    async (status) => {
+      provider.addMessage({
+        id: `draft-status-${status}`,
+        to: [{ email: 'to@example.com' }],
+        subject: 'Status',
+        body: 'plain',
+        from: { email: 'me@example.com' },
+        receivedAt: new Date().toISOString(),
+        isRead: true,
+        hasAttachments: false,
+      });
+      vi.spyOn(provider, 'getDraftReplyStatus').mockResolvedValueOnce(status);
+
+      const result = await inspectDraftExactAction.run(ctx, {
+        draft_id: `draft-status-${status}`,
+      });
+
+      expect(result.replyStatus).toBe(status);
+      expect(result.draftId).toBe(`draft-status-${status}`);
+      expect(result.subject).toBe('Status');
+    },
+  );
+
+  it('sets replyStatus to indeterminate when getDraftReplyStatus throws', async () => {
+    provider.addMessage({
+      id: 'draft-status-throw',
+      to: [{ email: 'to@example.com' }],
+      subject: 'Status',
+      body: 'plain',
+      from: { email: 'me@example.com' },
+      receivedAt: new Date().toISOString(),
+      isRead: true,
+      hasAttachments: false,
+    });
+    vi.spyOn(provider, 'getDraftReplyStatus').mockRejectedValueOnce(new Error('metadata unavailable'));
+
+    const result = await inspectDraftExactAction.run(ctx, {
+      draft_id: 'draft-status-throw',
+    });
+
+    expect(result.replyStatus).toBe('indeterminate');
+    expect(result.draftId).toBe('draft-status-throw');
+    expect(result.subject).toBe('Status');
+  });
+
+  it('omits replyStatus when the provider does not implement getDraftReplyStatus', async () => {
+    provider.addMessage({
+      id: 'draft-status-absent',
+      to: [{ email: 'to@example.com' }],
+      subject: 'Status',
+      body: 'plain',
+      from: { email: 'me@example.com' },
+      receivedAt: new Date().toISOString(),
+      isRead: true,
+      hasAttachments: false,
+    });
+    (provider as Record<string, unknown>).getDraftReplyStatus = undefined;
+
+    const result = await inspectDraftExactAction.run(ctx, {
+      draft_id: 'draft-status-absent',
+    });
+
+    expect(result).not.toHaveProperty('replyStatus');
+    expect(result.draftId).toBe('draft-status-absent');
+    expect(result.subject).toBe('Status');
+  });
 });
 
 describe('email-write/Create Draft', () => {
