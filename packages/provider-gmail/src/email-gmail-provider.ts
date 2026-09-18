@@ -951,13 +951,80 @@ function serializeTextPart(content: string, contentType: 'text/plain' | 'text/ht
   ].join(CRLF);
 }
 
+const PRINTABLE_ASCII = /^[ -~]*$/;
+
+/** Join `units` into chunks of at most `max` chars without splitting a unit. */
+function chunkUnits(units: string[], max: number): string[] {
+  const chunks: string[] = [];
+  let current = '';
+  for (const unit of units) {
+    if (current && current.length + unit.length > max) {
+      chunks.push(current);
+      current = '';
+    }
+    current += unit;
+  }
+  if (current) chunks.push(current);
+  return chunks;
+}
+
+/**
+ * `name`/`filename` parameters for an attachment part. Printable-ASCII names
+ * (spaces and parentheses included) are legal inside a MIME quoted-string as
+ * is. Non-ASCII names get an RFC 2047 encoded-word `name` plus an RFC 2231
+ * `filename*` (with continuations, so no header line exceeds the 998 limit).
+ * No plain `filename` fallback is emitted beside it: parsers disagree on which
+ * of the two wins, and a lossy fallback would reintroduce mangled names.
+ */
+function attachmentNameParams(name: string): { typeParam: string; dispositionParams: string } {
+  if (PRINTABLE_ASCII.test(name)) {
+    return { typeParam: `name="${name}"`, dispositionParams: `filename="${name}"` };
+  }
+
+  // A lone surrogate is not encodable as UTF-8 (encodeURIComponent throws).
+  const chars = Array.from(name.replace(/\p{Cs}/gu, '_'));
+
+  // 45 UTF-8 bytes -> 60 base64 chars -> a 72-char encoded-word (limit 75).
+  const words: string[] = [];
+  let pending = '';
+  for (const c of chars) {
+    if (pending && Buffer.byteLength(pending + c, 'utf-8') > 45) {
+      words.push(pending);
+      pending = '';
+    }
+    pending += c;
+  }
+  words.push(pending);
+  const encodedWords = words
+    .map(w => `=?UTF-8?B?${Buffer.from(w, 'utf-8').toString('base64')}?=`)
+    .join(`${CRLF} `);
+
+  // RFC 5987 attr-char: encodeURIComponent leaves ' ( ) * unescaped.
+  const pctUnits = chars.map(c =>
+    encodeURIComponent(c).replace(/['()*]/g, m => `%${m.charCodeAt(0).toString(16).toUpperCase()}`),
+  );
+  // One unit per character, so no segment ends mid-way through a UTF-8 sequence.
+  const segments = chunkUnits(pctUnits, 60);
+  const extended = segments.length === 1
+    ? `filename*=UTF-8''${segments[0]}`
+    : segments
+        .map((seg, i) => `filename*${i}*=${i === 0 ? "UTF-8''" : ''}${seg}`)
+        .join(`;${CRLF} `);
+
+  return {
+    typeParam: `name="${encodedWords}"`,
+    dispositionParams: extended,
+  };
+}
+
 function serializeAttachmentPart(att: OutboundAttachment): MimePart {
   const name = att.filename.replace(/[\r\n"\\]+/g, '_') || 'attachment';
   const mimeType = att.mimeType.replace(/[\r\n";]+/g, '') || 'application/octet-stream';
+  const { typeParam, dispositionParams } = attachmentNameParams(name);
   return [
-    `Content-Type: ${mimeType}; name="${name}"`,
+    `Content-Type: ${mimeType}; ${typeParam}`,
     'Content-Transfer-Encoding: base64',
-    `Content-Disposition: attachment; filename="${name}"`,
+    `Content-Disposition: attachment; ${dispositionParams}`,
     '',
     wrapBase64(att.content.toString('base64')),
   ].join(CRLF);

@@ -83,6 +83,58 @@ export function sanitizeFilename(filename: string): string {
   return (sanitized || 'attachment') + ext;
 }
 
+/** Longest display name passed to a provider, in code points (extension kept). */
+export const MAX_ATTACHMENT_DISPLAY_NAME_LENGTH = 255;
+
+// C0/C1 controls (CR, LF, NUL, TAB, ...), DEL, Unicode line/paragraph
+// separators, and bidi embedding/override/isolate controls. The first group
+// enables header injection in a MIME part; the bidi group lets a name render
+// as a different extension than it has ("exe.docx" spoofing).
+const DISPLAY_NAME_CONTROL_CHARS = /[\u0000-\u001f\u007f-\u009f\u2028\u2029\u200e\u200f\u202a-\u202e\u2066-\u2069]/g;
+
+// `"` and `\` break a MIME quoted-string; `/` and `\` are path separators; the
+// rest are reserved on Windows, so a recipient could not save the file as named.
+const DISPLAY_NAME_RESERVED_CHARS = /["\\/<>:|?*]/g;
+
+/**
+ * Sanitize a filename used ONLY as an outbound attachment display name (Graph
+ * `fileAttachment.name`, MIME `Content-Disposition: filename`). It is never
+ * used as a local path, so ordinary document names keep their spaces,
+ * parentheses, punctuation, and non-ASCII letters. For names that touch local
+ * storage or are echoed back as a safe-to-write name, use `sanitizeFilename`.
+ *
+ * Still enforced: directory components are dropped (no traversal), control and
+ * bidi characters and quoting/reserved characters are neutralized, and the
+ * result is length-capped with its extension preserved.
+ */
+export function sanitizeAttachmentDisplayName(filename: string): string {
+  const leaf = filename.slice(Math.max(filename.lastIndexOf('/'), filename.lastIndexOf('\\')) + 1);
+
+  let name = leaf
+    .normalize('NFC')
+    .replace(DISPLAY_NAME_CONTROL_CHARS, '_')
+    .replace(DISPLAY_NAME_RESERVED_CHARS, '_')
+    // Lone surrogates cannot be encoded as UTF-8 by a provider.
+    .replace(/\p{Cs}/gu, '_')
+    .replace(/\s+/g, ' ')
+    .trim()
+    // Windows silently drops trailing dots/spaces; do it deterministically here.
+    .replace(/[. ]+$/, '');
+
+  if (name === '' || /^\.+$/.test(name)) {
+    return 'attachment';
+  }
+
+  const chars = Array.from(name);
+  if (chars.length > MAX_ATTACHMENT_DISPLAY_NAME_LENGTH) {
+    const ext = Array.from(extname(name)).slice(0, 32);
+    const base = chars.slice(0, MAX_ATTACHMENT_DISPLAY_NAME_LENGTH - ext.length);
+    name = (base.join('').replace(/[. ]+$/, '') || 'attachment') + ext.join('');
+  }
+
+  return name;
+}
+
 // List attachments for a message
 const ListAttachmentsInput = z.object({
   message_id: z.string(),

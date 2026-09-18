@@ -2959,6 +2959,47 @@ describe('provider-microsoft/Outbound Attachments', () => {
     expect(graphMsg.attachments![0]!['@odata.type']).toBe('#microsoft.graph.fileAttachment');
   });
 
+  // Regression: Graph takes `name` as a JSON string, so spaces and parentheses
+  // need no escaping and must reach the draft exactly as supplied.
+  it('Scenario: createDraft sends the attachment display name verbatim', async () => {
+    const NDA = 'Paxden NDA (Patty) (Silver Point) (Redline) (SP 2026-09-17 v01 vs PP 2026-09-18 v04).docx';
+    const client = createMockClient();
+    const provider = new GraphEmailProvider(client);
+
+    await provider.createDraft({
+      to: [{ email: 'bob@corp.com' }],
+      subject: 'NDA redline',
+      body: 'body',
+      attachments: [{
+        filename: NDA,
+        content: PDF,
+        mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      }],
+    });
+
+    const call = (client.post as MockFn).mock.calls.find(c => String(c[0]).endsWith('/messages'))!;
+    const graphMsg = call[1] as { attachments?: Array<Record<string, unknown>> };
+    expect(graphMsg.attachments![0]!.name).toBe(NDA);
+    // Survives the JSON encoding the HTTP client applies to the payload.
+    expect(JSON.parse(JSON.stringify(graphMsg)).attachments[0].name).toBe(NDA);
+  });
+
+  it('Scenario: addDraftAttachments sends the attachment display name verbatim', async () => {
+    const NDA = 'Paxden NDA (Patty) (Silver Point) (Redline) (SP 2026-09-17 v01 vs PP 2026-09-18 v04).docx';
+    const client = createMockClient({
+      get: vi.fn().mockResolvedValue({ id: 'draft-1', isDraft: true }),
+    });
+    const provider = new GraphEmailProvider(client);
+
+    const result = await provider.addDraftAttachments('draft-1', [
+      { filename: NDA, content: PDF, mimeType: 'application/octet-stream' },
+    ]);
+
+    expect(result.success).toBe(true);
+    const attCalls = (client.post as MockFn).mock.calls.filter(c => String(c[0]).endsWith('/attachments'));
+    expect(attCalls[0]![1]).toMatchObject({ name: NDA });
+  });
+
   it('Scenario: reply draft attachments use the two-step POST /attachments flow', async () => {
     const client = createMockClient({
       post: vi.fn()

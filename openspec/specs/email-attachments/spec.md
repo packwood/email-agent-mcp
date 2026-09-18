@@ -50,8 +50,36 @@ The system SHALL validate file content by checking actual bytes (null byte check
 
 ### Requirement: Filename Sanitization
 
-The system SHALL sanitize special characters in filenames (spaces, dashes, non-ASCII) before processing, preserving the file extension.
+The system SHALL sanitize filenames that it reports for inbound attachments (`list_attachments`, `download_attachment`) to a safe ASCII form — special characters such as spaces, parentheses, and non-ASCII replaced — preserving the file extension, because callers use that value to write the attachment to local storage. The provider's original name SHALL be returned alongside it as `original_filename`.
+
+This storage-safe form SHALL NOT be applied to outbound attachment display names; see "Outbound Attachment Display Name".
 
 #### Scenario: Special characters in filename
-- **WHEN** an attachment has filename "Term Sheet - Alexander Morgan (Draft).pdf"
-- **THEN** the system sanitizes to a safe ASCII filename while preserving the `.pdf` extension
+- **WHEN** an inbound attachment has filename "Term Sheet - Alexander Morgan (Draft).pdf"
+- **THEN** the system reports a safe ASCII `filename` while preserving the `.pdf` extension
+- **AND** reports the unmodified name as `original_filename`
+
+### Requirement: Outbound Attachment Display Name
+
+The system SHALL transmit an outbound attachment's filename to the provider as a display name, preserving ordinary document-name characters — spaces, parentheses, brackets, hyphens, periods, commas, apostrophes, ampersands, and non-ASCII letters. The display name is never used as a local filesystem path; the file itself is read through the sandboxed `path` reader, which is unaffected by this requirement.
+
+The system SHALL still neutralize, by replacing with `_` or removing:
+- directory components — only the final path segment is kept, and a name that is empty or consists only of dots becomes `attachment`;
+- control characters (including CR, LF, NUL, and TAB), Unicode line/paragraph separators, bidirectional-override characters, and unpaired surrogates;
+- `"` and `\`, which would break a MIME quoted-string, and the characters `/ < > : | ? *`, which a recipient on Windows could not save;
+- trailing dots and spaces.
+
+Display names SHALL be capped at 255 characters with the extension preserved.
+
+Providers that serialize MIME themselves (Gmail) SHALL emit printable-ASCII names as a quoted-string, and SHALL encode names containing non-ASCII characters per RFC 2231 (`filename*`, using continuations so no header line exceeds the RFC 5322 line limit) with an RFC 2047 encoded-word `name` parameter.
+
+#### Scenario: Business-document name is preserved
+- **WHEN** a draft is created with an attachment named "Paxden NDA (Patty) (Silver Point) (Redline) (SP 2026-09-17 v01 vs PP 2026-09-18 v04).docx"
+- **THEN** the Graph `fileAttachment.name` / MIME `filename` is exactly that string
+- **AND** the MIME type is still detected from content and extension
+
+#### Scenario: Hostile display name is neutralized
+- **WHEN** an attachment `filename` override contains directory components, CR/LF, or a double quote
+- **THEN** only the final path segment is used and the offending characters are replaced with `_`
+- **AND** no additional MIME header or parameter is produced
+

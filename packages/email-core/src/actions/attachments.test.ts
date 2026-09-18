@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { MockEmailProvider } from '../testing/mock-provider.js';
-import { listAttachmentsAction, downloadAttachmentAction, detectMimeType, validateAttachment, sanitizeFilename, ZIP_CONTAINER_TYPES } from './attachments.js';
+import { listAttachmentsAction, downloadAttachmentAction, detectMimeType, validateAttachment, sanitizeFilename, sanitizeAttachmentDisplayName, MAX_ATTACHMENT_DISPLAY_NAME_LENGTH, ZIP_CONTAINER_TYPES } from './attachments.js';
 import { AttachmentNotSupportedError, AttachmentNotFoundError } from '../providers/provider.js';
 import type { ActionContext } from './registry.js';
 
@@ -358,5 +358,61 @@ describe('email-attachments/Filename Sanitization', () => {
     expect(result).not.toContain(')');
     // Should be a reasonable filename
     expect(result.length).toBeGreaterThan(4);
+  });
+});
+
+describe('email-attachments/Outbound Attachment Display Name', () => {
+  const NDA = 'Paxden NDA (Patty) (Silver Point) (Redline) (SP 2026-09-17 v01 vs PP 2026-09-18 v04).docx';
+  const BACKSLASH = String.fromCharCode(92);
+  const RLO = String.fromCodePoint(0x202e);
+
+  it('Scenario: Business-document name is preserved', () => {
+    expect(sanitizeAttachmentDisplayName(NDA)).toBe(NDA);
+    const busy = "Q3 Report - Final, v2 [signed] & approved (O'Brien) #4.pdf";
+    expect(sanitizeAttachmentDisplayName(busy)).toBe(busy);
+  });
+
+  it('Scenario: non-ASCII letters are preserved', () => {
+    expect(sanitizeAttachmentDisplayName('Résumé – 契約書.pdf')).toBe('Résumé – 契約書.pdf');
+  });
+
+  it('Scenario: directory components are dropped', () => {
+    expect(sanitizeAttachmentDisplayName('../../etc/passwd')).toBe('passwd');
+    expect(sanitizeAttachmentDisplayName('/abs/dir/My File (1).docx')).toBe('My File (1).docx');
+    expect(sanitizeAttachmentDisplayName(['C:', 'Users', 'josh', 'My File.docx'].join(BACKSLASH))).toBe('My File.docx');
+    expect(sanitizeAttachmentDisplayName('..')).toBe('attachment');
+    expect(sanitizeAttachmentDisplayName('dir/')).toBe('attachment');
+    expect(sanitizeAttachmentDisplayName('')).toBe('attachment');
+  });
+
+  it('Scenario: Hostile display name is neutralized', () => {
+    const hostile = ['a', String.fromCharCode(13, 10), 'Bcc: evil@x.com', String.fromCharCode(0), '"; x="y', BACKSLASH, '.pdf'].join('');
+    const out = sanitizeAttachmentDisplayName(hostile);
+    for (const code of [0, 10, 13, 34, 92]) {
+      expect(out).not.toContain(String.fromCharCode(code));
+    }
+    expect(out.endsWith('.pdf')).toBe(true);
+    expect(sanitizeAttachmentDisplayName(`tab${String.fromCharCode(9)}here.txt`)).toBe('tab_here.txt');
+  });
+
+  it('Scenario: bidi override cannot disguise the extension', () => {
+    expect(sanitizeAttachmentDisplayName(`invoice${RLO}xcod.exe`)).toBe('invoice_xcod.exe');
+  });
+
+  it('Scenario: Windows-reserved characters are replaced', () => {
+    expect(sanitizeAttachmentDisplayName('a<b>c:d|e?f*g.txt')).toBe('a_b_c_d_e_f_g.txt');
+    expect(sanitizeAttachmentDisplayName('trailing dots... ')).toBe('trailing dots');
+  });
+
+  it('Scenario: over-long names are capped with the extension kept', () => {
+    const out = sanitizeAttachmentDisplayName('x'.repeat(400) + '.docx');
+    expect(Array.from(out)).toHaveLength(MAX_ATTACHMENT_DISPLAY_NAME_LENGTH);
+    expect(out.endsWith('.docx')).toBe(true);
+  });
+
+  it('Scenario: storage sanitizer is unchanged for local and download names', () => {
+    expect(sanitizeFilename(NDA)).toBe(
+      'Paxden_NDA_Patty_Silver_Point_Redline_SP_2026-09-17_v01_vs_PP_2026-09-18_v04.docx',
+    );
   });
 });

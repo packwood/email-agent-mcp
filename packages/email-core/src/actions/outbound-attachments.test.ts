@@ -225,6 +225,70 @@ describe('outbound-attachments/create_draft', () => {
     expect(draft!.attachments).toHaveLength(1);
     expect(draft!.attachments![0]!.filename).toBe('doc.pdf');
   });
+
+  // Regression: the display name must reach the provider unmangled. It used to
+  // arrive as Paxden_NDA_Patty_Silver_Point_Redline_SP_..._v04.docx.
+  const NDA = 'Paxden NDA (Patty) (Silver Point) (Redline) (SP 2026-09-17 v01 vs PP 2026-09-18 v04).docx';
+  const DOCX_BYTES = Buffer.from([0x50, 0x4b, 0x03, 0x04, 0x14, 0x00, 0x06, 0x00, 0x08, 0x00]);
+  const DOCX_MIME = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+
+  it('Scenario: path attachment keeps spaces and parentheses in its display name', async () => {
+    await writeFile(join(testDir, NDA), DOCX_BYTES);
+
+    const result = await createDraftAction.run(ctx, {
+      to: 'anyone@example.com',
+      subject: 'NDA redline',
+      body: 'body',
+      attachments: [{ path: NDA }],
+    });
+
+    expect(result.success).toBe(true);
+    const att = provider.getDrafts().get(result.draftId!)!.attachments![0]!;
+    expect(att.filename).toBe(NDA);
+    expect(att.mimeType).toBe(DOCX_MIME);
+  });
+
+  it('Scenario: base64 attachment keeps an explicit display name verbatim', async () => {
+    const result = await createDraftAction.run(ctx, {
+      to: 'anyone@example.com',
+      subject: 'NDA redline',
+      body: 'body',
+      attachments: [{ base64: DOCX_BYTES.toString('base64'), filename: NDA }],
+    });
+
+    expect(result.success).toBe(true);
+    const att = provider.getDrafts().get(result.draftId!)!.attachments![0]!;
+    expect(att.filename).toBe(NDA);
+    expect(att.mimeType).toBe(DOCX_MIME);
+  });
+
+  it('Scenario: filename override cannot smuggle a directory or header break', async () => {
+    const result = await createDraftAction.run(ctx, {
+      to: 'anyone@example.com',
+      subject: 'Hostile name',
+      body: 'body',
+      attachments: [{
+        base64: PDF_BYTES.toString('base64'),
+        filename: ['../../etc/evil', String.fromCharCode(13, 10), 'Bcc: x@evil.com".pdf'].join(''),
+      }],
+    });
+
+    expect(result.success).toBe(true);
+    const name = provider.getDrafts().get(result.draftId!)!.attachments![0]!.filename;
+    expect(name).toBe('evil__Bcc_ x@evil.com_.pdf');
+  });
+
+  it('Scenario: path traversal is still refused by the sandboxed reader', async () => {
+    const result = await createDraftAction.run(ctx, {
+      to: 'anyone@example.com',
+      subject: 'Traversal',
+      body: 'body',
+      attachments: [{ path: '../../etc/passwd' }],
+    });
+
+    expect(result.success).toBe(false);
+    expect(provider.getDrafts().size).toBe(0);
+  });
 });
 
 describe('outbound-attachments/update_draft', () => {

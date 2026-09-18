@@ -1804,6 +1804,116 @@ describe('provider-gmail/buildRawMessage attachments', () => {
     expect(raw).toContain(PDF.toString('base64'));
   });
 
+  // Regression: spaces and parentheses are legal inside a MIME quoted-string,
+  // so an ordinary document name is emitted as is.
+  it('Scenario: attachment display name keeps spaces and parentheses', async () => {
+    const NDA = 'Paxden NDA (Patty) (Silver Point) (Redline) (SP 2026-09-17 v01 vs PP 2026-09-18 v04).docx';
+    const client = createMockGmailClient();
+    const provider = new GmailEmailProvider(client);
+
+    await provider.createDraft({
+      to: [{ email: 'bob@corp.com' }],
+      subject: 'NDA redline',
+      body: 'see attached',
+      attachments: [{
+        filename: NDA,
+        content: PDF,
+        mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      }],
+    });
+
+    const raw = lastRaw(client.createDraft as ReturnType<typeof vi.fn>);
+    expect(raw).toContain(`Content-Disposition: attachment; filename="${NDA}"`);
+    expect(raw).toContain(`; name="${NDA}"`);
+    expect(raw).not.toContain('Paxden_NDA');
+  });
+
+  it('Scenario: attachment name cannot inject a header or close the quoted-string', async () => {
+    const client = createMockGmailClient();
+    const provider = new GmailEmailProvider(client);
+    const hostile = ['a', String.fromCharCode(13, 10), 'Bcc: evil@x.com', '"; x="y.pdf'].join('');
+
+    await provider.sendMessage({
+      to: [{ email: 'bob@corp.com' }],
+      subject: 'Hostile name',
+      body: 'body',
+      attachments: [{ filename: hostile, content: PDF, mimeType: 'application/pdf' }],
+    });
+
+    const raw = lastRaw(client.sendMessage as ReturnType<typeof vi.fn>);
+    expect(raw).not.toMatch(/^Bcc:/m);
+    expect(raw).toContain('filename="a_Bcc: evil@x.com_; x=_y.pdf"');
+  });
+
+  /** Reassemble the percent-encoded RFC 2231 `filename*` value (single or continued). */
+  function rfc2231Filename(raw: string): string {
+    const single = /filename[*]=UTF-8''([^;]+?)[ ]*$/m.exec(raw);
+    if (single) return single[1]!;
+    const segments = [...raw.matchAll(/filename[*](\d+)[*]=(?:UTF-8'')?([^;]+?);?[ ]*$/gm)];
+    expect(segments.length).toBeGreaterThan(1);
+    expect(segments.map(m => Number(m[1]))).toEqual(segments.map((_, i) => i));
+    return segments.map(m => m[2]).join('');
+  }
+
+  it('Scenario: non-ASCII attachment name uses RFC 2231 and an encoded-word name', async () => {
+    const client = createMockGmailClient();
+    const provider = new GmailEmailProvider(client);
+    const name = 'Résumé (final) 契約書.pdf';
+
+    await provider.sendMessage({
+      to: [{ email: 'bob@corp.com' }],
+      subject: 'Unicode name',
+      body: 'body',
+      attachments: [{ filename: name, content: PDF, mimeType: 'application/pdf' }],
+    });
+
+    const raw = lastRaw(client.sendMessage as ReturnType<typeof vi.fn>);
+    // No lossy plain `filename=` beside `filename*` — parsers disagree on precedence.
+    expect(raw).not.toContain('filename="');
+    const extended = rfc2231Filename(raw);
+    expect(decodeURIComponent(extended)).toBe(name);
+    expect(extended).not.toMatch(/[()' ]/);
+    const word = /name="=[?]UTF-8[?]B[?]([A-Za-z0-9+/=]+)[?]="/.exec(raw)![1]!;
+    expect(Buffer.from(word, 'base64').toString('utf-8')).toBe(name);
+  });
+
+  it('Scenario: malformed UTF-16 in an attachment name does not throw', async () => {
+    const client = createMockGmailClient();
+    const provider = new GmailEmailProvider(client);
+
+    const result = await provider.sendMessage({
+      to: [{ email: 'bob@corp.com' }],
+      subject: 'Lone surrogate',
+      body: 'body',
+      attachments: [{ filename: `café${String.fromCharCode(0xd800)}.pdf`, content: PDF, mimeType: 'application/pdf' }],
+    });
+
+    expect(result.success).toBe(true);
+    const raw = lastRaw(client.sendMessage as ReturnType<typeof vi.fn>);
+    expect(decodeURIComponent(rfc2231Filename(raw))).toBe('café_.pdf');
+  });
+
+  it('Scenario: long non-ASCII name folds into RFC 2231 continuations under the line limit', async () => {
+    const client = createMockGmailClient();
+    const provider = new GmailEmailProvider(client);
+    const name = '契'.repeat(120) + '.pdf';
+
+    await provider.sendMessage({
+      to: [{ email: 'bob@corp.com' }],
+      subject: 'Long unicode name',
+      body: 'body',
+      attachments: [{ filename: name, content: PDF, mimeType: 'application/pdf' }],
+    });
+
+    const raw = lastRaw(client.sendMessage as ReturnType<typeof vi.fn>);
+    // RFC 5322 hard limit is 998 octets per line; an unfolded parameter would be ~3300.
+    for (const line of raw.split(String.fromCharCode(13, 10))) {
+      expect(line.length).toBeLessThanOrEqual(998);
+    }
+    expect(raw).toContain('filename*0*=UTF-8');
+    expect(decodeURIComponent(rfc2231Filename(raw))).toBe(name);
+  });
+
   it('Scenario: text body uses quoted-printable, not 7bit', async () => {
     const client = createMockGmailClient();
     const provider = new GmailEmailProvider(client);

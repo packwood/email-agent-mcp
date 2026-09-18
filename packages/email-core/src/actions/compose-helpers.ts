@@ -8,7 +8,7 @@ import { resolveBodyFile } from '../content/body-loader.js';
 import { resolveAttachmentFile } from '../content/attachment-loader.js';
 import type { BodyFormat } from '../content/body-renderer.js';
 import { parseAddressList } from '../utils/address.js';
-import { validateAttachment, sanitizeFilename } from './attachments.js';
+import { validateAttachment, sanitizeAttachmentDisplayName } from './attachments.js';
 import type { EmailAddress, EmailMessage, OutboundAttachment } from '../types.js';
 
 // --- Error shape used by all actions ---
@@ -226,7 +226,10 @@ export async function resolveAttachments(
       defaultName = 'attachment';
     }
 
-    const filename = sanitizeFilename(att.filename ?? defaultName);
+    // Display name only — this never becomes a local path (the read above is
+    // sandboxed on `att.path`), so keep spaces/parentheses rather than applying
+    // the storage-oriented sanitizeFilename.
+    const filename = sanitizeAttachmentDisplayName(att.filename ?? defaultName);
     const validation = validateAttachment(content, filename, att.mimeType);
     if (!validation.valid) {
       return {
