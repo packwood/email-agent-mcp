@@ -571,6 +571,54 @@ describe('provider-microsoft/Nango token source', () => {
     expect(graphCalls).toBe(6);
   });
 
+  function unreadableBody(status: number): Response {
+    return new Response(new ReadableStream({
+      pull(controller) {
+        controller.error(new Error(`read failed ${SECRET} ${TOKEN} ${CONNECTION_ID} ${LEAK}`));
+      },
+    }), { status, headers: { 'Content-Type': 'application/json' } });
+  }
+
+  it.each([
+    ['non-JSON body', 200, () => poisoned(200, `not-json ${TOKEN} ${SECRET} ${CONNECTION_ID} ${LEAK}`)],
+    ['unreadable body', 200, () => unreadableBody(200)],
+    ['empty body', 204, () => new Response(null, { status: 204 })],
+  ] as const)('maps a 2xx Graph identity %s to NangoIdentityCheckError', async (_label, status, respond) => {
+    const source = createSource({}, async url => {
+      if (url.startsWith('https://graph.microsoft.com/')) return respond();
+      return json(nangoBody());
+    });
+    const err = await rejectionFrom(() => source.getAccessToken());
+    expect(err).toBeInstanceOf(NangoIdentityCheckError);
+    expect(err).not.toBeInstanceOf(NangoInvalidResponseError);
+    expect(err.code).toBe('NANGO_IDENTITY_CHECK_FAILED');
+    expect(err.message).toBe(
+      `Microsoft Graph identity check returned an unreadable response for ${ACCOUNT} (HTTP ${status})`,
+    );
+
+    const refreshErr = await rejectionFrom(() => source.refreshAfterAuthError());
+    expect(refreshErr).toBeInstanceOf(NangoIdentityCheckError);
+    expect(refreshErr).not.toBeInstanceOf(NangoInvalidResponseError);
+    expect(refreshErr.message).toBe(
+      `Microsoft Graph identity check returned an unreadable response for ${ACCOUNT} (HTTP ${status})`,
+    );
+  });
+
+  it('maps an unreadable Nango body to NangoInvalidResponseError', async () => {
+    const unread = createSource({}, async () => unreadableBody(200));
+    const readErr = await rejectionFrom(() => unread.getAccessToken());
+    expect(readErr).toBeInstanceOf(NangoInvalidResponseError);
+    expect(readErr).not.toBeInstanceOf(NangoIdentityCheckError);
+    expect(readErr.code).toBe('NANGO_INVALID_RESPONSE');
+    expect(readErr.message).toBe(`Nango returned an invalid response for ${ACCOUNT} (HTTP 200)`);
+
+    const garbage = createSource({}, async () => poisoned(200, `not-json ${TOKEN} ${SECRET} ${CONNECTION_ID} ${LEAK}`));
+    const garbageErr = await rejectionFrom(() => garbage.getAccessToken());
+    expect(garbageErr).toBeInstanceOf(NangoInvalidResponseError);
+    expect(garbageErr).not.toBeInstanceOf(NangoIdentityCheckError);
+    expect(garbageErr.message).toContain('(HTTP 200)');
+  });
+
   it('maps a non-2xx Graph identity response to NangoIdentityCheckError', async () => {
     const source = createSource({}, async url => {
       if (url.startsWith('https://graph.microsoft.com/')) return poisoned(401);

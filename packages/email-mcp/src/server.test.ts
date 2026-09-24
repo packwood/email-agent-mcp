@@ -3120,6 +3120,37 @@ describe('mcp-transport/Nango Outlook transport selection', () => {
     expect(state.status).toBe('connected');
   });
 
+  it('Scenario: malformed Nango connections and no mailboxes is a configuration error, not demo mode', async () => {
+    delete process.env['EMAIL_AGENT_MCP_NANGO_OUTLOOK_ACCOUNTS'];
+    delete process.env['EMAIL_AGENT_MCP_NANGO_SECRET_KEY'];
+    delete process.env['EMAIL_AGENT_MCP_NANGO_HOST'];
+    process.env['EMAIL_AGENT_MCP_NANGO_OUTLOOK_CONNECTIONS'] =
+      '[{"account":"hosted@example.com","connectionId":"LEAK-CONN-ID"';
+
+    const state = createLazyProviderState();
+    await initProvider(state);
+
+    expect(state.status).toBe('error');
+    expect(state.isDemo).toBe(true);
+    expect(state.error).toBe('Invalid Nango Outlook connections configuration');
+    expect(state.mailboxes).toEqual([]);
+    expect(state.provider).toBeNull();
+    expect(state.auth).toBeNull();
+    expect(logs()).toContain(
+      '[email-agent-mcp] Nango Outlook configuration is invalid; Nango mailboxes are unavailable',
+    );
+    expect(logs().match(/Nango Outlook configuration is invalid/g)).toHaveLength(1);
+    expect(logs()).not.toContain('No configured mailboxes');
+    expect(logs()).not.toContain('running in demo mode');
+    expect(logs()).not.toContain('LEAK-CONN-ID');
+    expect(state.error).not.toContain('LEAK-CONN-ID');
+    expect(nangoWiring.nango).toEqual([]);
+    expect(nangoWiring.delegatedMailboxes).toEqual([]);
+    expect(nangoWiring.matonConnectionIds).toEqual([]);
+    expect(nangoWiring.realGraphOptions).toEqual([]);
+    expect(vi.mocked(fetch)).not.toHaveBeenCalled();
+  });
+
   it('Scenario: with no Nango env, Maton Outlook is unchanged', async () => {
     await writeMicrosoftMailbox('other', 'other@example.com');
     await writeMatonConnections([

@@ -115,13 +115,21 @@ export class NangoIdentityMismatchError extends NangoTransportError {
 }
 
 export class NangoIdentityCheckError extends NangoTransportError {
-  constructor(account: string, status?: number, timedOut = false) {
+  /** Graph returned a response whose body could not be read or parsed. */
+  static unreadable(account: string, status: number): NangoIdentityCheckError {
+    return new NangoIdentityCheckError(account, status, false, true);
+  }
+
+  constructor(account: string, status?: number, timedOut = false, unreadable = false) {
     // No HTTP status on a network failure or timeout: there was no Graph response.
-    const message = status === undefined
-      ? timedOut
-        ? `Microsoft Graph identity check timed out for ${account}`
-        : `Microsoft Graph identity check could not reach Microsoft Graph for ${account}`
-      : `Microsoft Graph identity check failed for ${account} (HTTP ${status})`;
+    // A 2xx body that cannot be read or parsed still came from Graph, not Nango.
+    const message = unreadable
+      ? `Microsoft Graph identity check returned an unreadable response for ${account} (HTTP ${status})`
+      : status === undefined
+        ? timedOut
+          ? `Microsoft Graph identity check timed out for ${account}`
+          : `Microsoft Graph identity check could not reach Microsoft Graph for ${account}`
+        : `Microsoft Graph identity check failed for ${account} (HTTP ${status})`;
     super('NANGO_IDENTITY_CHECK_FAILED', account, message);
   }
 }
@@ -406,7 +414,7 @@ export class NangoTokenSource {
       await discardBody(response);
       throw new NangoIdentityCheckError(this.account, response.status);
     }
-    const body = await this.readJson(response);
+    const body = await this.readJson(response, 'identity');
     const mail = isRecord(body) ? body.mail : undefined;
     const userPrincipalName = isRecord(body) ? body.userPrincipalName : undefined;
     if (!addressMatches(mail, this.account) && !addressMatches(userPrincipalName, this.account)) {
@@ -439,17 +447,20 @@ export class NangoTokenSource {
     }
   }
 
-  private async readJson(response: Response): Promise<unknown> {
+  private async readJson(response: Response, failure: 'nango' | 'identity' = 'nango'): Promise<unknown> {
+    const invalid = (): NangoTransportError => failure === 'identity'
+      ? NangoIdentityCheckError.unreadable(this.account, response.status)
+      : new NangoInvalidResponseError(this.account, response.status);
     let text: string;
     try {
       text = await response.text();
     } catch {
-      throw new NangoInvalidResponseError(this.account, response.status);
+      throw invalid();
     }
     try {
       return JSON.parse(text) as unknown;
     } catch {
-      throw new NangoInvalidResponseError(this.account, response.status);
+      throw invalid();
     }
   }
 }

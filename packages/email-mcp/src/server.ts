@@ -730,6 +730,16 @@ export async function initProvider(state: LazyProviderState): Promise<void> {
       matonGmailAccounts.length === 0 &&
       nangoDesignated.size === 0
     ) {
+      // Hosted deploys often have no local mailbox files. A Nango env var that
+      // failed to parse is a configuration error, not "nothing is configured".
+      // The one-line configuration message was already logged when it was recorded.
+      if (nangoEnvPresent && nangoConfigError) {
+        state.mailboxes = [];
+        state.isDemo = true;
+        state.status = 'error';
+        state.error = nangoConfigError.message;
+        return;
+      }
       state.isDemo = true;
       state.status = 'not_configured';
       state.mailboxes = [];
