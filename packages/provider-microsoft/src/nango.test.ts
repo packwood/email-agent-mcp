@@ -460,25 +460,62 @@ describe('provider-microsoft/Nango token source', () => {
     expect(nangoCalls).toBe(2);
   });
 
-  it('runs the identity check once per instance after it passes', async () => {
+  it('re-checks identity on every new Nango fetch but not on a cache hit', async () => {
     let graphCalls = 0;
     let nangoCalls = 0;
-    const expiresAt = new Date(clock.now + 10 * 60 * 1000).toISOString();
+    let mismatch = false;
     const source = createSource({}, async url => {
       if (url.startsWith('https://graph.microsoft.com/')) {
         graphCalls += 1;
+        if (mismatch) {
+          return graphIdentity({ mail: OTHER_ADDRESS, userPrincipalName: OTHER_ADDRESS });
+        }
         return graphIdentity({ userPrincipalName: 'Joshua@Example.com' });
       }
       nangoCalls += 1;
-      return json(nangoBody(expiresAt));
+      // Fresh expiry on each fetch so a successful check is actually cached.
+      return json(nangoBody(new Date(clock.now + 10 * 60 * 1000).toISOString()));
     });
 
-    await source.getAccessToken();
-    await source.getAccessToken();
-    clock.now += 5 * 60 * 1000;
-    await source.getAccessToken();
-    expect(nangoCalls).toBe(2);
+    await expect(source.getAccessToken()).resolves.toBe(TOKEN);
+    await expect(source.getAccessToken()).resolves.toBe(TOKEN);
+    expect(nangoCalls).toBe(1);
     expect(graphCalls).toBe(1);
+
+    clock.now += 5 * 60 * 1000;
+    await expect(source.getAccessToken()).resolves.toBe(TOKEN);
+    expect(nangoCalls).toBe(2);
+    expect(graphCalls).toBe(2);
+    await expect(source.getAccessToken()).resolves.toBe(TOKEN);
+    expect(nangoCalls).toBe(2);
+    expect(graphCalls).toBe(2);
+
+    await expect(source.forceRefresh()).resolves.toBe(true);
+    expect(nangoCalls).toBe(3);
+    expect(graphCalls).toBe(3);
+
+    await expect(source.refreshAfterAuthError()).resolves.toBe(true);
+    expect(nangoCalls).toBe(4);
+    expect(graphCalls).toBe(4);
+    await expect(source.getAccessToken()).resolves.toBe(TOKEN);
+    expect(nangoCalls).toBe(4);
+    expect(graphCalls).toBe(4);
+
+    mismatch = true;
+    clock.now += 5 * 60 * 1000;
+    const err = await rejectionFrom(() => source.getAccessToken());
+    expect(err).toBeInstanceOf(NangoIdentityMismatchError);
+    expect(err.code).toBe('NANGO_IDENTITY_MISMATCH');
+    expect(err.message).toBe(`Nango connection does not belong to ${ACCOUNT}`);
+    expect(err.message).not.toContain(OTHER_ADDRESS);
+    expect(nangoCalls).toBe(5);
+    expect(graphCalls).toBe(5);
+
+    // The rejected token was not cached, so the next read fetches again.
+    const again = await rejectionFrom(() => source.getAccessToken());
+    expect(again).toBeInstanceOf(NangoIdentityMismatchError);
+    expect(nangoCalls).toBe(6);
+    expect(graphCalls).toBe(6);
   });
 
   it('maps a non-2xx Graph identity response to NangoIdentityCheckError', async () => {

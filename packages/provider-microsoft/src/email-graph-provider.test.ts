@@ -3260,4 +3260,85 @@ describe('provider-microsoft/Graph request deadline', () => {
     expect(signals[0]?.aborted).toBe(false);
     expect(signals[1]?.aborted).toBe(false);
   });
+
+  it('aborts a hung GET when deadlineMs is set', async () => {
+    const fetchMock = vi.fn((_url: string, init: RequestInit) => new Promise<Response>((_resolve, reject) => {
+      const signal = init.signal;
+      if (!signal) {
+        reject(new Error('expected an abort signal'));
+        return;
+      }
+      const fail = () => {
+        reject(signal.reason instanceof Error ? signal.reason : new Error('aborted'));
+      };
+      if (signal.aborted) fail();
+      else signal.addEventListener('abort', fail, { once: true });
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const client = new RealGraphApiClient(async () => 'token-123', undefined, { deadlineMs: 40 });
+    await expect(client.get('/me/messages')).rejects.toMatchObject({ name: 'TimeoutError' });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const init = fetchMock.mock.calls[0]?.[1] as RequestInit;
+    expect((init.method ?? 'GET').toUpperCase()).toBe('GET');
+    expect(init.signal).toBeInstanceOf(AbortSignal);
+    expect(init.signal?.aborted).toBe(true);
+  });
+
+  it('gives POST, PATCH, and DELETE no abort signal when deadlineMs is set, including a 401 retry', async () => {
+    const seen: RequestInit[] = [];
+    let postCalls = 0;
+    const fetchMock = vi.fn((_url: string, init: RequestInit) => new Promise<Response>((resolve, reject) => {
+      seen.push(init);
+      const method = (init.method ?? 'GET').toUpperCase();
+      const finish = () => {
+        if (method === 'POST') {
+          postCalls += 1;
+          if (postCalls === 1) {
+            resolve(new Response('unauthorized', { status: 401 }));
+            return;
+          }
+          resolve(new Response('', { status: 202 }));
+          return;
+        }
+        resolve(new Response(null, { status: 204 }));
+      };
+      // Outlive the deadline. A signal would abort this; a write must not have one.
+      const timer = setTimeout(finish, 50);
+      const signal = init.signal;
+      if (signal) {
+        const fail = () => {
+          clearTimeout(timer);
+          reject(signal.reason instanceof Error ? signal.reason : new Error('aborted'));
+        };
+        if (signal.aborted) fail();
+        else signal.addEventListener('abort', fail, { once: true });
+      }
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    let tokenVersion = 0;
+    const client = new RealGraphApiClient(
+      async () => `token-v${++tokenVersion}`,
+      async () => true,
+      { deadlineMs: 20 },
+    );
+    await expect(client.post('/me/sendMail', { message: { subject: 'hi' } })).resolves.toEqual({});
+    await expect(client.patch('/me/messages/draft-1', { subject: 'hi' })).resolves.toBeUndefined();
+    await expect(client.delete('/me/messages/draft-1')).resolves.toBeUndefined();
+
+    expect(seen.map(init => (init.method ?? 'GET').toUpperCase())).toEqual([
+      'POST',
+      'POST',
+      'PATCH',
+      'DELETE',
+    ]);
+    for (const init of seen) {
+      expect(init.signal).toBeUndefined();
+      expect(Object.hasOwn(init, 'signal')).toBe(false);
+    }
+    expect((seen[0]?.headers as Record<string, string>).Authorization).toBe('Bearer token-v1');
+    expect((seen[1]?.headers as Record<string, string>).Authorization).toBe('Bearer token-v2');
+  });
 });

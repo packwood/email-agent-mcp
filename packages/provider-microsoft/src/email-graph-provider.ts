@@ -279,6 +279,11 @@ function trustedGraphUrl(url: string): string {
 /**
  * Real Graph API client using fetch + Bearer token.
  * Used when connected to a real mailbox via DelegatedAuthManager.
+ *
+ * `deadlineMs` bounds GET only. POST, PATCH, and DELETE stay without an abort
+ * signal: email-core's withRetry retries any error that is not a ProviderError,
+ * so aborting a write Graph has already accepted (`/sendMail`, a draft create)
+ * could submit that write twice.
  */
 export class RealGraphApiClient implements GraphApiClient {
   private getToken: () => Promise<string>;
@@ -296,29 +301,39 @@ export class RealGraphApiClient implements GraphApiClient {
   }
 
   /**
-   * Fetch with automatic retry on 401 if onAuthError callback is provided, and on
-   * HTTP 429 throttling for reads. Writes are never retried: a throttled write may
-   * or may not have been applied, and re-sending mail is worse than surfacing the
-   * error. Mirrors the read-only retry policy of the Maton transports.
+   * One GET attempt. A configured deadline arms a fresh timeout signal for
+   * this attempt only. AbortSignal.timeout starts when created, so one signal
+   * reused across the retry loop would abort a later attempt as soon as the
+   * first deadline elapsed. With no deadline the GET is unchanged, including
+   * the absence of a signal.
    *
-   * When a deadline is configured, each attempt gets its own timeout signal.
-   * AbortSignal.timeout is armed when created, so one signal reused across the
-   * retry loop would abort later attempts as soon as the first deadline elapsed.
-   * With no deadline the request is unchanged, including the absence of a signal.
+   * Writes must not come through here. A POST, PATCH, or DELETE that Graph
+   * accepted but answered slowly must not be aborted: email-core's withRetry
+   * retries any non-ProviderError, so a timed-out `/sendMail` or draft create
+   * could be submitted twice. Those methods call fetch with the same arguments
+   * they had before the deadline existed, and no signal is added.
    */
-  private fetchGraph(url: string, init: RequestInit): Promise<Response> {
+  private fetchGet(url: string, init: RequestInit): Promise<Response> {
     if (this.deadlineMs === undefined) return fetch(url, init);
     const deadline = AbortSignal.timeout(this.deadlineMs);
     const signal = init.signal ? AbortSignal.any([init.signal, deadline]) : deadline;
     return fetch(url, { ...init, signal });
   }
 
+  /**
+   * Fetch with automatic retry on 401 if onAuthError callback is provided, and on
+   * HTTP 429 throttling for reads. Writes are never retried: a throttled write may
+   * or may not have been applied, and re-sending mail is worse than surfacing the
+   * error. Mirrors the read-only retry policy of the Maton transports.
+   *
+   * The deadline is GET-only. Writes call fetch directly, with no abort signal.
+   */
   private async fetchWithAuthRetry(url: string, init: RequestInit): Promise<Response> {
     const method = (init.method ?? 'GET').toUpperCase();
     const attempts = method === 'GET' ? MAX_READ_ATTEMPTS : 1;
     let resp!: Response;
     for (let attempt = 0; attempt < attempts; attempt += 1) {
-      resp = await this.fetchGraph(url, init);
+      resp = method === 'GET' ? await this.fetchGet(url, init) : await fetch(url, init);
       if (resp.status === 401 && this.onAuthError) {
         // Do not catch. A 401 means Graph did not apply the request, so a throw
         // from onAuthError (dead grant, identity failure) must reach the caller.
@@ -326,7 +341,11 @@ export class RealGraphApiClient implements GraphApiClient {
         if (ok) {
           const newToken = await this.getToken();
           const retryHeaders = { ...(init.headers as Record<string, string>), Authorization: `Bearer ${newToken}` };
-          resp = await this.fetchGraph(url, { ...init, headers: retryHeaders });
+          if (method === 'GET') {
+            resp = await this.fetchGet(url, { ...init, headers: retryHeaders });
+          } else {
+            resp = await fetch(url, { ...init, headers: retryHeaders });
+          }
         }
       }
       if (resp.status !== 429 || attempt === attempts - 1) break;

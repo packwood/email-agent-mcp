@@ -232,7 +232,6 @@ export class NangoTokenSource {
 
   private cached: CachedToken | null = null;
   private inFlight: Promise<string> | null = null;
-  private identityVerified = false;
   private grantExpiredWarning: string | undefined;
   private generation = 0;
   private requestSerial = 0;
@@ -266,7 +265,7 @@ export class NangoTokenSource {
     return flight;
   }
 
-  /** Drop the in-memory token. Does not forget a passed identity check. */
+  /** Drop the in-memory token. The next token fetched from Nango is identity-checked again. */
   invalidate(): void {
     this.cached = null;
     this.generation += 1;
@@ -385,8 +384,13 @@ export class NangoTokenSource {
     return now + FALLBACK_TTL_MS;
   }
 
+  /**
+   * Confirm a token just fetched from Nango, before it is cached or returned.
+   * A connection can be re-authorised to a different Microsoft account between
+   * fetches, so a check that passed for an earlier token does not cover this
+   * one. Cache hits never reach here.
+   */
   private async ensureIdentity(token: string): Promise<void> {
-    if (this.identityVerified) return;
     const response = await this.request(GRAPH_IDENTITY_URL, `Bearer ${token}`, 'identity');
     if (!response.ok) {
       await discardBody(response);
@@ -398,7 +402,6 @@ export class NangoTokenSource {
     if (!addressMatches(mail, this.account) && !addressMatches(userPrincipalName, this.account)) {
       throw new NangoIdentityMismatchError(this.account);
     }
-    this.identityVerified = true;
   }
 
   private async request(
