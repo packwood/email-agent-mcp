@@ -320,6 +320,8 @@ export class RealGraphApiClient implements GraphApiClient {
     for (let attempt = 0; attempt < attempts; attempt += 1) {
       resp = await this.fetchGraph(url, init);
       if (resp.status === 401 && this.onAuthError) {
+        // Do not catch. A 401 means Graph did not apply the request, so a throw
+        // from onAuthError (dead grant, identity failure) must reach the caller.
         const ok = await this.onAuthError();
         if (ok) {
           const newToken = await this.getToken();

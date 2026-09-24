@@ -2370,6 +2370,30 @@ describe('provider-microsoft/Graph API Auth Retry', () => {
     expect(onAuthError).toHaveBeenCalledOnce();
     expect(result).toEqual({});
   });
+
+  it('rejects GET and POST with the error thrown by onAuthError and does not retry', async () => {
+    const authError = new Error('Nango could not refresh the Microsoft grant for mailbox (HTTP 424); reconnect this mailbox in Nango');
+
+    const getFetch = vi.fn().mockResolvedValue({
+      ok: false, status: 401, text: async () => 'Unauthorized',
+    });
+    vi.stubGlobal('fetch', getFetch);
+    const onGetAuthError = vi.fn().mockRejectedValue(authError);
+    const getClient = new RealGraphApiClient(async () => 'token', onGetAuthError);
+    await expect(getClient.get('/me/messages')).rejects.toBe(authError);
+    expect(onGetAuthError).toHaveBeenCalledOnce();
+    expect(getFetch).toHaveBeenCalledOnce();
+
+    const postFetch = vi.fn().mockResolvedValue({
+      ok: false, status: 401, text: async () => 'Unauthorized',
+    });
+    vi.stubGlobal('fetch', postFetch);
+    const onPostAuthError = vi.fn().mockRejectedValue(authError);
+    const postClient = new RealGraphApiClient(async () => 'token', onPostAuthError);
+    await expect(postClient.post('/me/sendMail', { message: {} })).rejects.toBe(authError);
+    expect(onPostAuthError).toHaveBeenCalledOnce();
+    expect(postFetch).toHaveBeenCalledOnce();
+  });
 });
 
 describe('provider-microsoft/Delta Query Sync Protocol', () => {

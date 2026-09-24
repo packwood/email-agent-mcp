@@ -765,7 +765,7 @@ export async function initProvider(state: LazyProviderState): Promise<void> {
         });
         const client = new RealGraphApiClient(
           () => source.getAccessToken(),
-          () => source.forceRefresh(),
+          () => source.refreshAfterAuthError(),
           { deadlineMs: 90_000 },
         );
         const mailboxAuth: LazyProviderAuth = {

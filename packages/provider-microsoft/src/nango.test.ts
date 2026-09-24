@@ -492,6 +492,46 @@ describe('provider-microsoft/Nango token source', () => {
     expect(err.message).toBe(`Microsoft Graph identity check failed for ${ACCOUNT} (HTTP 401)`);
   });
 
+  it('maps a Graph identity network throw and timeout to NangoIdentityCheckError', async () => {
+    const network = createSource({}, async url => {
+      if (url.startsWith('https://graph.microsoft.com/')) {
+        throw new Error(`connect ECONNREFUSED ${SECRET} ${CONNECTION_ID} ${TOKEN} ${LEAK}`);
+      }
+      return json(nangoBody());
+    });
+    const networkErr = await rejectionFrom(() => network.getAccessToken());
+    expect(networkErr).toBeInstanceOf(NangoIdentityCheckError);
+    expect(networkErr).not.toBeInstanceOf(NangoUnreachableError);
+    expect(networkErr.code).toBe('NANGO_IDENTITY_CHECK_FAILED');
+    expect(networkErr.message).toBe(
+      `Microsoft Graph identity check could not reach Microsoft Graph for ${ACCOUNT}`,
+    );
+
+    const timeout = createSource({ timeoutMs: 20 }, (url, init) => {
+      if (!url.startsWith('https://graph.microsoft.com/')) return Promise.resolve(json(nangoBody()));
+      return new Promise((_resolve, reject) => {
+        const signal = init?.signal;
+        const fail = () => {
+          const reason = signal?.reason;
+          reject(reason instanceof Error
+            ? reason
+            : Object.assign(new Error(`timeout ${SECRET} ${CONNECTION_ID} ${TOKEN}`), { name: 'TimeoutError' }));
+        };
+        if (!signal) {
+          fail();
+          return;
+        }
+        if (signal.aborted) fail();
+        else signal.addEventListener('abort', fail, { once: true });
+      });
+    });
+    const timeoutErr = await rejectionFrom(() => timeout.getAccessToken());
+    expect(timeoutErr).toBeInstanceOf(NangoIdentityCheckError);
+    expect(timeoutErr).not.toBeInstanceOf(NangoUnreachableError);
+    expect(timeoutErr.code).toBe('NANGO_IDENTITY_CHECK_FAILED');
+    expect(timeoutErr.message).toBe(`Microsoft Graph identity check timed out for ${ACCOUNT}`);
+  });
+
   it('throws NangoNotConfiguredError before any request when the secret is missing', async () => {
     const fetchImpl = vi.fn();
     const source = createSource({ secretKey: '' }, fetchImpl);
@@ -528,6 +568,91 @@ describe('provider-microsoft/Nango token source', () => {
     const failed = urls.slice(beforeFailure);
     expect(failed.some(url => url.includes('force_refresh=true'))).toBe(true);
     expect(failed.some(url => url.includes('/proxy'))).toBe(false);
+  });
+
+  it('refreshAfterAuthError forces a refresh and returns false only when Nango is unreachable', async () => {
+    const urls: string[] = [];
+    let nangoCalls = 0;
+    let nangoDown = false;
+    const success = createSource({}, async url => {
+      urls.push(url);
+      if (url.startsWith('https://graph.microsoft.com/')) return graphIdentity({ mail: ACCOUNT });
+      nangoCalls += 1;
+      if (nangoDown) return poisoned(503, `down ${SECRET} ${CONNECTION_ID} ${TOKEN} ${LEAK}`);
+      return json(nangoBody());
+    });
+    await success.getAccessToken();
+    const afterCache = urls.length;
+    await expect(success.refreshAfterAuthError()).resolves.toBe(true);
+    const refreshed = urls.slice(afterCache);
+    expect(refreshed.some(url => url.includes('force_refresh=true'))).toBe(true);
+    expect(refreshed.some(url => url.includes('/proxy'))).toBe(false);
+    expect(nangoCalls).toBe(2);
+
+    nangoDown = true;
+    await expect(success.refreshAfterAuthError()).resolves.toBe(false);
+    expect(nangoCalls).toBe(3);
+    // invalidate() ran, so the token cached by the successful refresh is gone.
+    const unreachable = await rejectionFrom(() => success.getAccessToken());
+    expect(unreachable).toBeInstanceOf(NangoUnreachableError);
+    expect(nangoCalls).toBe(4);
+
+    const network = createSource({}, async url => {
+      if (url.startsWith('https://graph.microsoft.com/')) return graphIdentity({ mail: ACCOUNT });
+      throw new Error(`connect ECONNREFUSED ${SECRET} ${CONNECTION_ID} ${TOKEN} ${LEAK}`);
+    });
+    await expect(network.refreshAfterAuthError()).resolves.toBe(false);
+  });
+
+  it.each([
+    ['grant expired', async () => poisoned(424), NangoGrantExpiredError],
+    ['not found', async () => poisoned(404), NangoNotFoundError],
+    ['refused', async () => poisoned(401), NangoRefusedError],
+    ['invalid response', async () => poisoned(200, JSON.stringify({ credentials: { refresh_token: TOKEN }, leak: LEAK })), NangoInvalidResponseError],
+    ['missing secret', null, NangoNotConfiguredError],
+  ] as const)('refreshAfterAuthError rethrows a Nango %s error', async (_label, respond, ctor) => {
+    const fetchImpl = vi.fn(async () => respond ? respond() : json(nangoBody()));
+    const source = createSource(respond ? {} : { secretKey: '' }, fetchImpl);
+    const err = await rejectionFrom(() => source.refreshAfterAuthError());
+    expect(err).toBeInstanceOf(ctor);
+    if (ctor === NangoGrantExpiredError) {
+      expect(err.message).toBe(
+        `Nango could not refresh the Microsoft grant for ${ACCOUNT} (HTTP 424); reconnect this mailbox in Nango`,
+      );
+    }
+    if (!respond) expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it('refreshAfterAuthError rethrows identity mismatch and identity-check failures', async () => {
+    const mismatch = createSource({}, async url => {
+      if (url.startsWith('https://graph.microsoft.com/')) {
+        return graphIdentity({ mail: OTHER_ADDRESS, userPrincipalName: OTHER_ADDRESS });
+      }
+      return json(nangoBody());
+    });
+    const mismatchErr = await rejectionFrom(() => mismatch.refreshAfterAuthError());
+    expect(mismatchErr).toBeInstanceOf(NangoIdentityMismatchError);
+
+    const httpFail = createSource({}, async url => {
+      if (url.startsWith('https://graph.microsoft.com/')) return poisoned(401);
+      return json(nangoBody());
+    });
+    const httpErr = await rejectionFrom(() => httpFail.refreshAfterAuthError());
+    expect(httpErr).toBeInstanceOf(NangoIdentityCheckError);
+    expect(httpErr.message).toBe(`Microsoft Graph identity check failed for ${ACCOUNT} (HTTP 401)`);
+
+    const graphDown = createSource({}, async url => {
+      if (url.startsWith('https://graph.microsoft.com/')) {
+        throw new Error(`connect ECONNREFUSED ${SECRET} ${CONNECTION_ID} ${TOKEN} ${LEAK}`);
+      }
+      return json(nangoBody());
+    });
+    const graphErr = await rejectionFrom(() => graphDown.refreshAfterAuthError());
+    expect(graphErr).toBeInstanceOf(NangoIdentityCheckError);
+    expect(graphErr).not.toBeInstanceOf(NangoUnreachableError);
+    expect(graphErr.message).toBe(
+      `Microsoft Graph identity check could not reach Microsoft Graph for ${ACCOUNT}`,
+    );
   });
 
   it('never requests a URL containing /proxy', async () => {

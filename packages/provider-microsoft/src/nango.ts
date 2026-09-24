@@ -105,12 +105,14 @@ export class NangoIdentityMismatchError extends NangoTransportError {
 }
 
 export class NangoIdentityCheckError extends NangoTransportError {
-  constructor(account: string, status: number) {
-    super(
-      'NANGO_IDENTITY_CHECK_FAILED',
-      account,
-      `Microsoft Graph identity check failed for ${account} (HTTP ${status})`,
-    );
+  constructor(account: string, status?: number, timedOut = false) {
+    // No HTTP status on a network failure or timeout: there was no Graph response.
+    const message = status === undefined
+      ? timedOut
+        ? `Microsoft Graph identity check timed out for ${account}`
+        : `Microsoft Graph identity check could not reach Microsoft Graph for ${account}`
+      : `Microsoft Graph identity check failed for ${account} (HTTP ${status})`;
+    super('NANGO_IDENTITY_CHECK_FAILED', account, message);
   }
 }
 
@@ -286,6 +288,25 @@ export class NangoTokenSource {
     }
   }
 
+  /**
+   * Drop the cache and ask Nango to refresh after Graph returned 401.
+   * Returns false only when Nango itself is unreachable or timed out, so the
+   * caller can still surface that 401. Every other transport error is rethrown:
+   * Graph did not apply the request, and a dead grant, a missing connection,
+   * or a failed identity check must not be hidden behind a generic Graph 401.
+   * Nothing from the Nango body is logged.
+   */
+  async refreshAfterAuthError(): Promise<boolean> {
+    this.invalidate();
+    try {
+      await this.obtainToken(true);
+      return true;
+    } catch (err) {
+      if (err instanceof NangoUnreachableError) return false;
+      throw err;
+    }
+  }
+
   getTokenHealthWarning(): string | undefined {
     return this.grantExpiredWarning;
   }
@@ -329,7 +350,7 @@ export class NangoTokenSource {
   }
 
   private async fetchNangoToken(force: boolean): Promise<{ token: string; cacheUntil: number | null }> {
-    const response = await this.request(this.connectionUrl(force), `Bearer ${this.secretKey}`);
+    const response = await this.request(this.connectionUrl(force), `Bearer ${this.secretKey}`, 'nango');
     if (!response.ok || response.status !== 200) {
       await discardBody(response);
       throw this.statusError(response.status);
@@ -366,7 +387,7 @@ export class NangoTokenSource {
 
   private async ensureIdentity(token: string): Promise<void> {
     if (this.identityVerified) return;
-    const response = await this.request(GRAPH_IDENTITY_URL, `Bearer ${token}`);
+    const response = await this.request(GRAPH_IDENTITY_URL, `Bearer ${token}`, 'identity');
     if (!response.ok) {
       await discardBody(response);
       throw new NangoIdentityCheckError(this.account, response.status);
@@ -380,7 +401,11 @@ export class NangoTokenSource {
     this.identityVerified = true;
   }
 
-  private async request(url: string, authorization: string): Promise<Response> {
+  private async request(
+    url: string,
+    authorization: string,
+    failure: 'nango' | 'identity',
+  ): Promise<Response> {
     try {
       return await this.fetchImpl(url, {
         method: 'GET',
@@ -391,7 +416,13 @@ export class NangoTokenSource {
     } catch (err) {
       // Replace the client error. Its message often includes the request URL
       // (and therefore the connection id) or, on a timeout, nothing we need.
-      throw new NangoUnreachableError(this.account, undefined, isAbortFailure(err));
+      // Blame the service this call was talking to: a Graph /me failure is not
+      // "Nango is unreachable".
+      const timedOut = isAbortFailure(err);
+      if (failure === 'identity') {
+        throw new NangoIdentityCheckError(this.account, undefined, timedOut);
+      }
+      throw new NangoUnreachableError(this.account, undefined, timedOut);
     }
   }
 
