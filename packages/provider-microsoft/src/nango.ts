@@ -10,8 +10,18 @@ const DEFAULT_TIMEOUT_MS = 15_000;
 const GRAPH_IDENTITY_URL = 'https://graph.microsoft.com/v1.0/me?$select=mail,userPrincipalName';
 
 const PROVIDER_CONFIG_KEY_PATTERN = /^[a-z0-9][a-z0-9._-]{0,127}$/;
-const CONNECTION_ID_PATTERN = /^[A-Za-z0-9._~:@+-]{1,255}$/;
 const CONNECTION_FIELDS = ['account', 'providerConfigKey', 'connectionId'] as const;
+
+/**
+ * Nango connection ids are opaque. '/' '%' '=' and spaces are valid; the id is
+ * encodeURIComponent-encoded in the request path. Reject control characters
+ * and whitespace-only values. Never echo the id in an error.
+ */
+function isAcceptedConnectionId(connectionId: string): boolean {
+  if (connectionId.length < 1 || connectionId.length > 255) return false;
+  if (/[\u0000-\u001F\u007F]/.test(connectionId)) return false;
+  return connectionId.trim() !== '';
+}
 
 export interface NangoOutlookConnection {
   account: string;
@@ -141,7 +151,7 @@ function readConnection(item: unknown): NangoOutlookConnection {
   const normalised = normalizeAccount(account);
   if (!normalised.includes('@')) invalidConfig();
   if (!PROVIDER_CONFIG_KEY_PATTERN.test(providerConfigKey)) invalidConfig();
-  if (!CONNECTION_ID_PATTERN.test(connectionId)) invalidConfig();
+  if (!isAcceptedConnectionId(connectionId)) invalidConfig();
   return { account: normalised, providerConfigKey, connectionId };
 }
 

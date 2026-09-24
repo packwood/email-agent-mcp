@@ -179,7 +179,6 @@ describe('provider-microsoft/Nango Outlook connections', () => {
   });
 
   it.each([
-    ['bad connection id', { account: ACCOUNT, providerConfigKey: 'microsoft', connectionId: 'bad id/secret' }],
     ['bad provider key', { account: ACCOUNT, providerConfigKey: 'Microsoft', connectionId }],
     ['extra field', { account: ACCOUNT, providerConfigKey: 'microsoft', connectionId, region: 'us' }],
     ['missing @', { account: 'not-an-email', providerConfigKey: 'microsoft', connectionId }],
@@ -191,9 +190,63 @@ describe('provider-microsoft/Nango Outlook connections', () => {
       parseNangoOutlookConnections(raw);
     } catch (err) {
       expect(String(err)).not.toContain(connectionId);
-      expect(String(err)).not.toContain('bad id/secret');
       expect(String(err)).not.toContain(raw);
     }
+  });
+
+  it.each([
+    ['a slash', 'id/with/slash'],
+    ['a percent', 'id%percent'],
+    ['an equals sign', 'id=equals'],
+    ['a space', 'id with space'],
+  ])('parses a connection id with %s and encodes it in the request path', async (_label, id) => {
+    const parsed = parseNangoOutlookConnections(JSON.stringify([
+      { account: ACCOUNT, providerConfigKey: PROVIDER_KEY, connectionId: id },
+    ]));
+    expect(parsed.get(ACCOUNT)?.connectionId).toBe(id);
+
+    const calls: string[] = [];
+    const source = createSource({ connectionId: id }, async (url) => {
+      calls.push(url);
+      if (url.startsWith('https://graph.microsoft.com/')) return graphIdentity({ mail: ACCOUNT });
+      return json(nangoBody());
+    });
+    await expect(source.getAccessToken()).resolves.toBe(TOKEN);
+    const encoded = encodeURIComponent(id);
+    expect(encoded).not.toBe(id);
+    expect(calls[0]).toBe(
+      `https://nango.example.com/connection/${encoded}?provider_config_key=${encodeURIComponent(PROVIDER_KEY)}`,
+    );
+  });
+
+  it.each([
+    ['a NUL', 'bad\u0000id'],
+    ['a unit separator', 'bad\u001fid'],
+    ['a DEL', 'bad\u007fid'],
+    ['empty', ''],
+    ['whitespace only', '   '],
+    ['256 characters', 'a'.repeat(256)],
+  ])('rejects a connection id that is %s without echoing it', (_label, badId) => {
+    const raw = JSON.stringify([
+      { account: ACCOUNT, providerConfigKey: 'microsoft', connectionId: badId },
+    ]);
+    expect(() => parseNangoOutlookConnections(raw)).toThrow('Invalid Nango Outlook connections configuration');
+    try {
+      parseNangoOutlookConnections(raw);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      expect(message).toBe('Invalid Nango Outlook connections configuration');
+      expect(String(err)).not.toContain(raw);
+      if (badId !== '') expect(String(err)).not.toContain(badId);
+    }
+  });
+
+  it('accepts a 255-character connection id', () => {
+    const connectionId = `${'/'.repeat(254)}=`;
+    const parsed = parseNangoOutlookConnections(JSON.stringify([
+      { account: ACCOUNT, providerConfigKey: PROVIDER_KEY, connectionId },
+    ]));
+    expect(parsed.get(ACCOUNT)?.connectionId).toBe(connectionId);
   });
 
   it('rejects invalid JSON without echoing the document', () => {

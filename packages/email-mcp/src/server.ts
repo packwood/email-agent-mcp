@@ -627,7 +627,10 @@ export async function initProvider(state: LazyProviderState): Promise<void> {
     let nangoHost = 'https://api.nango.dev';
     let nangoConfigError: Error | null = null;
     let nangoSecretMissing = false;
+    let nangoConnectionsUnparsed = false;
     const nangoSecretKey = nangoSecretRaw?.trim() ?? '';
+    const nangoConnectionsConfigured =
+      nangoConnectionsRaw !== undefined && nangoConnectionsRaw !== '';
 
     if (nangoEnvPresent) {
       const problems: Error[] = [];
@@ -639,6 +642,7 @@ export async function initProvider(state: LazyProviderState): Promise<void> {
       try {
         nangoConnections = parseNangoOutlookConnections(nangoConnectionsRaw);
       } catch (err) {
+        nangoConnectionsUnparsed = true;
         problems.push(err instanceof Error ? err : new Error(String(err)));
       }
       const parsedDesignated = new Set<string>([...nangoAccounts, ...nangoConnections.keys()]);
@@ -663,6 +667,12 @@ export async function initProvider(state: LazyProviderState): Promise<void> {
     // Union of the accounts list and the parsed JSON. A designated mailbox is
     // never built with Maton or delegated OAuth, including when setup failed.
     const nangoDesignated = new Set<string>([...nangoAccounts, ...nangoConnections.keys()]);
+    // The connections document was set but could not be parsed, and the
+    // accounts list names nobody. Nothing tells us which local Outlook
+    // mailboxes were meant for Nango, so every Microsoft mailbox fails closed
+    // instead of falling through to Maton or OAuth. Gmail is unaffected.
+    const nangoOutlookUnattributable =
+      nangoConnectionsConfigured && nangoConnectionsUnparsed && nangoAccounts.size === 0;
     const nangoFailureMessage = (account: string): string => {
       if (nangoConfigError) return nangoConfigError.message;
       if (nangoSecretMissing) return new NangoNotConfiguredError(account).message;
@@ -704,6 +714,7 @@ export async function initProvider(state: LazyProviderState): Promise<void> {
           // Maton setup for the other Outlook mailboxes.
           microsoftMailboxes.flatMap(metadata => {
             if (!metadata.emailAddress) return [];
+            if (nangoOutlookUnattributable) return [];
             if (nangoDesignated.has(normaliseNangoAccount(metadata.emailAddress))) return [];
             return [metadata.emailAddress];
           }),
@@ -806,6 +817,22 @@ export async function initProvider(state: LazyProviderState): Promise<void> {
       const nangoAccount = metadata.emailAddress
         ? normaliseNangoAccount(metadata.emailAddress)
         : undefined;
+      if (nangoOutlookUnattributable) {
+        const error = nangoConfigError?.message ?? 'Invalid Nango Outlook connections configuration';
+        failedMailboxes.push({
+          name: metadata.mailboxName,
+          emailAddress: metadata.emailAddress,
+          displayName,
+          providerType: 'microsoft',
+          provider: null,
+          auth: null,
+          isDefault: false,
+          status: 'error',
+          error,
+        });
+        console.error(`[email-agent-mcp] Skipping mailbox "${displayName}": ${error}`);
+        continue;
+      }
       if (nangoAccount && nangoDesignated.has(nangoAccount)) {
         handledNangoAccounts.add(nangoAccount);
         recordNangoMailbox(nangoAccount, metadata.mailboxName, metadata.emailAddress, displayName);
