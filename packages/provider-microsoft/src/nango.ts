@@ -250,6 +250,8 @@ export class NangoTokenSource {
 
   private cached: CachedToken | null = null;
   private inFlight: Promise<string> | null = null;
+  /** True when `inFlight` is a force_refresh acquisition, not a plain read. */
+  private inFlightForced = false;
   private grantExpiredWarning: string | undefined;
   private generation = 0;
   private requestSerial = 0;
@@ -268,19 +270,10 @@ export class NangoTokenSource {
   async getAccessToken(): Promise<string> {
     const cached = this.freshCachedToken();
     if (cached !== undefined) return cached;
-    if (this.inFlight) return this.inFlight;
-
-    let settle!: (token: string) => void;
-    let fail!: (err: unknown) => void;
-    const flight = new Promise<string>((resolve, reject) => {
-      settle = resolve;
-      fail = reject;
-    });
-    this.inFlight = flight;
-    void this.obtainToken(false).then(settle, fail).finally(() => {
-      if (this.inFlight === flight) this.inFlight = null;
-    });
-    return flight;
+    // Join a forced refresh already in flight. A new non-forced fetch can
+    // finish later with a higher requestSerial and cache the credential
+    // Graph just rejected, which is what the 401 retry would then send.
+    return this.acquire(false);
   }
 
   /** Drop the in-memory token. The next token fetched from Nango is identity-checked again. */
@@ -295,9 +288,8 @@ export class NangoTokenSource {
    * from the Nango body, and we do not print it either.
    */
   async forceRefresh(): Promise<boolean> {
-    this.invalidate();
     try {
-      await this.obtainToken(true);
+      await this.beginForcedRefresh();
       return true;
     } catch (err) {
       if (err instanceof NangoTransportError) return false;
@@ -314,14 +306,52 @@ export class NangoTokenSource {
    * Nothing from the Nango body is logged.
    */
   async refreshAfterAuthError(): Promise<boolean> {
-    this.invalidate();
     try {
-      await this.obtainToken(true);
+      await this.beginForcedRefresh();
       return true;
     } catch (err) {
       if (err instanceof NangoUnreachableError) return false;
       throw err;
     }
+  }
+
+  /**
+   * Drop the cache and share one force_refresh fetch.
+   *
+   * A second caller must not invalidate again. That would bump generation
+   * past the fetch already in flight, the shared token would not be cached,
+   * and the 401 retry's following getAccessToken() could take a non-forced
+   * token instead.
+   */
+  private beginForcedRefresh(): Promise<string> {
+    if (!(this.inFlight && this.inFlightForced)) this.invalidate();
+    return this.acquire(true);
+  }
+
+  /**
+   * One Nango fetch at a time. A forced refresh replaces a non-forced fetch
+   * already in flight, and later readers wait on the forced token. The
+   * replaced fetch is left to finish; obtainToken's requestSerial and
+   * generation keep it from caching over the newer forced result.
+   */
+  private acquire(force: boolean): Promise<string> {
+    if (this.inFlight && (this.inFlightForced || !force)) return this.inFlight;
+
+    let settle!: (token: string) => void;
+    let fail!: (err: unknown) => void;
+    const flight = new Promise<string>((resolve, reject) => {
+      settle = resolve;
+      fail = reject;
+    });
+    this.inFlight = flight;
+    this.inFlightForced = force;
+    void this.obtainToken(force).then(settle, fail).finally(() => {
+      if (this.inFlight === flight) {
+        this.inFlight = null;
+        this.inFlightForced = false;
+      }
+    });
+    return flight;
   }
 
   getTokenHealthWarning(): string | undefined {

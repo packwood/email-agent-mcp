@@ -19,11 +19,13 @@ import {
 const ACCOUNT = 'joshua@example.com';
 const SECRET = 'nsk_7f3a9c_secret';
 const TOKEN = 'tok_7f3a9c_access';
+const STALE_TOKEN = 'tok_stale_7f3a9c';
+const FORCED_TOKEN = 'tok_forced_7f3a9c';
 const CONNECTION_ID = 'conn+7f3a9c@id';
 const PROVIDER_KEY = 'microsoft';
 const OTHER_ADDRESS = 'someone-else@contoso.example';
 const LEAK = 'LEAK7f3a9cBODY';
-const SECRETS = [SECRET, TOKEN, CONNECTION_ID, LEAK, OTHER_ADDRESS];
+const SECRETS = [SECRET, TOKEN, STALE_TOKEN, FORCED_TOKEN, CONNECTION_ID, LEAK, OTHER_ADDRESS];
 
 const clock = { now: Date.parse('2026-09-24T12:00:00.000Z') };
 const consoleLines: string[] = [];
@@ -77,8 +79,8 @@ function poisoned(status: number, body: string = JSON.stringify({
   return new Response(body, { status, headers: { 'Content-Type': 'application/json' } });
 }
 
-function nangoBody(expiresAt?: string | null): Record<string, unknown> {
-  const credentials: Record<string, unknown> = { access_token: TOKEN };
+function nangoBody(expiresAt?: string | null, accessToken = TOKEN): Record<string, unknown> {
+  const credentials: Record<string, unknown> = { access_token: accessToken };
   if (expiresAt !== null) {
     credentials.expires_at = expiresAt ?? new Date(clock.now + 60 * 60 * 1000).toISOString();
   }
@@ -117,7 +119,7 @@ function createSource(
 function expectSecretFree(err: unknown): void {
   const error = err as Error & { code?: string };
   const blob = `${error.message}\n${String(err)}\n${error.stack ?? ''}`;
-  for (const secret of [SECRET, TOKEN, CONNECTION_ID, LEAK]) {
+  for (const secret of [SECRET, TOKEN, STALE_TOKEN, FORCED_TOKEN, CONNECTION_ID, LEAK]) {
     expect(blob).not.toContain(secret);
   }
   expect(error.message).toContain(ACCOUNT);
@@ -791,6 +793,88 @@ describe('provider-microsoft/Nango token source', () => {
     expect(graphErr.message).toBe(
       `Microsoft Graph identity check could not reach Microsoft Graph for ${ACCOUNT}`,
     );
+  });
+
+  it('concurrent refreshAfterAuthError calls share one force_refresh request', async () => {
+    const nangoUrls: string[] = [];
+    let release!: (response: Response) => void;
+    const source = createSource({}, async url => {
+      if (url.startsWith('https://graph.microsoft.com/')) return graphIdentity({ mail: ACCOUNT });
+      nangoUrls.push(url);
+      return new Promise<Response>(resolve => {
+        release = resolve;
+      });
+    });
+
+    const first = source.refreshAfterAuthError();
+    const second = source.refreshAfterAuthError();
+    await Promise.resolve();
+    expect(nangoUrls).toEqual([
+      expect.stringContaining('force_refresh=true'),
+    ]);
+    release(json(nangoBody(undefined, FORCED_TOKEN)));
+    await expect(first).resolves.toBe(true);
+    await expect(second).resolves.toBe(true);
+    // The 401 retry reads the forced token from cache, not a second fetch.
+    await expect(source.getAccessToken()).resolves.toBe(FORCED_TOKEN);
+    expect(nangoUrls).toHaveLength(1);
+  });
+
+  it('getAccessToken during a forced refresh resolves to the forced token without another Nango request', async () => {
+    const nangoUrls: string[] = [];
+    let releaseForced!: (response: Response) => void;
+    const source = createSource({}, async url => {
+      if (url.startsWith('https://graph.microsoft.com/')) return graphIdentity({ mail: ACCOUNT });
+      nangoUrls.push(url);
+      if (url.includes('force_refresh=true')) {
+        return new Promise<Response>(resolve => {
+          releaseForced = resolve;
+        });
+      }
+      return json(nangoBody(undefined, STALE_TOKEN));
+    });
+
+    await expect(source.getAccessToken()).resolves.toBe(STALE_TOKEN);
+    expect(nangoUrls).toHaveLength(1);
+
+    const refresh = source.refreshAfterAuthError();
+    const read = source.getAccessToken();
+    await Promise.resolve();
+    expect(nangoUrls).toHaveLength(2);
+    expect(nangoUrls[1]).toContain('force_refresh=true');
+    releaseForced(json(nangoBody(undefined, FORCED_TOKEN)));
+    await expect(refresh).resolves.toBe(true);
+    await expect(read).resolves.toBe(FORCED_TOKEN);
+    await expect(source.getAccessToken()).resolves.toBe(FORCED_TOKEN);
+    expect(nangoUrls).toHaveLength(2);
+  });
+
+  it('a slow non-forced fetch does not replace the cached forced token', async () => {
+    const nangoUrls: string[] = [];
+    let releaseStale!: (response: Response) => void;
+    const source = createSource({}, async url => {
+      if (url.startsWith('https://graph.microsoft.com/')) return graphIdentity({ mail: ACCOUNT });
+      nangoUrls.push(url);
+      if (url.includes('force_refresh=true')) return json(nangoBody(undefined, FORCED_TOKEN));
+      return new Promise<Response>(resolve => {
+        releaseStale = resolve;
+      });
+    });
+
+    const slow = source.getAccessToken();
+    await Promise.resolve();
+    expect(nangoUrls).toHaveLength(1);
+    expect(nangoUrls[0]).not.toContain('force_refresh=true');
+
+    await expect(source.forceRefresh()).resolves.toBe(true);
+    expect(nangoUrls).toHaveLength(2);
+    expect(nangoUrls[1]).toContain('force_refresh=true');
+    await expect(source.getAccessToken()).resolves.toBe(FORCED_TOKEN);
+
+    releaseStale(json(nangoBody(undefined, STALE_TOKEN)));
+    await expect(slow).resolves.toBe(STALE_TOKEN);
+    await expect(source.getAccessToken()).resolves.toBe(FORCED_TOKEN);
+    expect(nangoUrls).toHaveLength(2);
   });
 
   it('never requests a URL containing /proxy', async () => {
