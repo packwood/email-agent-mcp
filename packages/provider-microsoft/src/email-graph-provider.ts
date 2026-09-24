@@ -283,10 +283,16 @@ function trustedGraphUrl(url: string): string {
 export class RealGraphApiClient implements GraphApiClient {
   private getToken: () => Promise<string>;
   private onAuthError?: () => Promise<boolean>;
+  private deadlineMs?: number;
 
-  constructor(getToken: () => Promise<string>, onAuthError?: () => Promise<boolean>) {
+  constructor(
+    getToken: () => Promise<string>,
+    onAuthError?: () => Promise<boolean>,
+    options?: { deadlineMs?: number },
+  ) {
     this.getToken = getToken;
     this.onAuthError = onAuthError;
+    this.deadlineMs = options?.deadlineMs;
   }
 
   /**
@@ -294,19 +300,31 @@ export class RealGraphApiClient implements GraphApiClient {
    * HTTP 429 throttling for reads. Writes are never retried: a throttled write may
    * or may not have been applied, and re-sending mail is worse than surfacing the
    * error. Mirrors the read-only retry policy of the Maton transports.
+   *
+   * When a deadline is configured, each attempt gets its own timeout signal.
+   * AbortSignal.timeout is armed when created, so one signal reused across the
+   * retry loop would abort later attempts as soon as the first deadline elapsed.
+   * With no deadline the request is unchanged, including the absence of a signal.
    */
+  private fetchGraph(url: string, init: RequestInit): Promise<Response> {
+    if (this.deadlineMs === undefined) return fetch(url, init);
+    const deadline = AbortSignal.timeout(this.deadlineMs);
+    const signal = init.signal ? AbortSignal.any([init.signal, deadline]) : deadline;
+    return fetch(url, { ...init, signal });
+  }
+
   private async fetchWithAuthRetry(url: string, init: RequestInit): Promise<Response> {
     const method = (init.method ?? 'GET').toUpperCase();
     const attempts = method === 'GET' ? MAX_READ_ATTEMPTS : 1;
     let resp!: Response;
     for (let attempt = 0; attempt < attempts; attempt += 1) {
-      resp = await fetch(url, init);
+      resp = await this.fetchGraph(url, init);
       if (resp.status === 401 && this.onAuthError) {
         const ok = await this.onAuthError();
         if (ok) {
           const newToken = await this.getToken();
           const retryHeaders = { ...(init.headers as Record<string, string>), Authorization: `Bearer ${newToken}` };
-          resp = await fetch(url, { ...init, headers: retryHeaders });
+          resp = await this.fetchGraph(url, { ...init, headers: retryHeaders });
         }
       }
       if (resp.status !== 429 || attempt === attempts - 1) break;

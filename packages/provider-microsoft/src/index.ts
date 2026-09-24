@@ -7,6 +7,23 @@ export {
   matonGraphUrl,
   type MatonOutlookConnection,
 } from './maton.js';
+export {
+  parseNangoOutlookConnections,
+  resolveNangoHost,
+  NangoTokenSource,
+  NangoTransportError,
+  NangoNotConfiguredError,
+  NangoRefusedError,
+  NangoNotFoundError,
+  NangoGrantExpiredError,
+  NangoUnreachableError,
+  NangoInvalidResponseError,
+  NangoIdentityMismatchError,
+  NangoIdentityCheckError,
+  type NangoOutlookConnection,
+  type NangoTokenSourceOptions,
+  type NangoFetch,
+} from './nango.js';
 export { DelegatedAuthManager, ClientCredentialsAuthManager, listConfiguredMailboxes, listConfiguredMailboxesWithMetadata, loadMailboxMetadata, toFilesystemSafeKey, getConfigDir, GRAPH_SCOPES, isAuthError } from './auth.js';
 export type { MailboxMetadata } from './auth.js';
 export {

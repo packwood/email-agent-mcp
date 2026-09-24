@@ -3175,3 +3175,65 @@ describe('provider-microsoft/Draft Attachment Mutations', () => {
     );
   });
 });
+
+describe('provider-microsoft/Graph request deadline', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('aborts a hung fetch when deadlineMs is set', async () => {
+    const fetchMock = vi.fn((_url: string, init: RequestInit) => new Promise<Response>((_resolve, reject) => {
+      const signal = init.signal;
+      if (!signal) {
+        reject(new Error('expected an abort signal'));
+        return;
+      }
+      const fail = () => {
+        reject(signal.reason instanceof Error ? signal.reason : new Error('aborted'));
+      };
+      if (signal.aborted) fail();
+      else signal.addEventListener('abort', fail, { once: true });
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const client = new RealGraphApiClient(async () => 'token-123', undefined, { deadlineMs: 40 });
+    await expect(client.get('/me/messages')).rejects.toThrow();
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const init = fetchMock.mock.calls[0]?.[1] as RequestInit;
+    expect(init.headers).toMatchObject({ Authorization: 'Bearer token-123' });
+    expect(init.signal).toBeInstanceOf(AbortSignal);
+    expect(init.signal?.aborted).toBe(true);
+  });
+
+  it('does not add an abort signal when no deadline is configured', async () => {
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ value: [] }), { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const client = new RealGraphApiClient(async () => 'token-123');
+    await expect(client.get('/me/messages')).resolves.toEqual({ value: [] });
+
+    const init = fetchMock.mock.calls[0]?.[1] as RequestInit;
+    expect(init.signal).toBeUndefined();
+    expect(Object.hasOwn(init, 'signal')).toBe(false);
+  });
+
+  it('arms a fresh deadline signal for each attempt, including the 401 retry', async () => {
+    const signals: AbortSignal[] = [];
+    const fetchMock = vi.fn((_url: string, init: RequestInit) => {
+      const signal = init.signal;
+      if (!signal) throw new Error('expected an abort signal');
+      signals.push(signal);
+      if (signals.length === 1) return Promise.resolve(new Response('unauthorized', { status: 401 }));
+      return Promise.resolve(new Response(JSON.stringify({ value: [] }), { status: 200 }));
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const client = new RealGraphApiClient(async () => 'token-123', async () => true, { deadlineMs: 5_000 });
+    await expect(client.get('/me/messages')).resolves.toEqual({ value: [] });
+    expect(signals).toHaveLength(2);
+    expect(signals[0]).not.toBe(signals[1]);
+    expect(signals[0]?.aborted).toBe(false);
+    expect(signals[1]?.aborted).toBe(false);
+  });
+});
