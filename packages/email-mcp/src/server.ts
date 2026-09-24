@@ -526,6 +526,35 @@ function resolveMailboxContext(
   };
 }
 
+/** Trim and lowercase a mailbox address for Nango account matching. */
+function normaliseNangoAccount(value: string): string {
+  return value.trim().toLowerCase();
+}
+
+/**
+ * `EMAIL_AGENT_MCP_NANGO_OUTLOOK_ACCOUNTS` — comma-separated addresses that must
+ * stay on Nango even when the connections JSON cannot be parsed. Empty segments
+ * are ignored. Any other entry must contain `@`. Valid addresses are kept even
+ * when another entry is invalid, so those mailboxes still fail closed instead
+ * of falling through to Maton or OAuth. The error names neither the raw list
+ * nor a connection id.
+ */
+function parseNangoOutlookAccounts(raw: string | undefined): { accounts: Set<string>; invalid: boolean } {
+  const accounts = new Set<string>();
+  if (raw === undefined || raw.trim() === '') return { accounts, invalid: false };
+  let invalid = false;
+  for (const part of raw.split(',')) {
+    const account = normaliseNangoAccount(part);
+    if (account === '') continue;
+    if (!account.includes('@')) {
+      invalid = true;
+      continue;
+    }
+    accounts.add(account);
+  }
+  return { accounts, invalid };
+}
+
 /**
  * Background-safe provider initialization. Iterates configured mailboxes,
  * records success or failure on `state`. **Never throws** — fire-and-forget
@@ -542,6 +571,10 @@ export async function initProvider(state: LazyProviderState): Promise<void> {
         loadMatonOutlookConnections,
         resolveMatonOutlookConnection,
         GraphEmailProvider,
+        parseNangoOutlookConnections,
+        resolveNangoHost,
+        NangoTokenSource,
+        NangoNotConfiguredError,
       },
       {
         listConfiguredGmailMailboxes,
@@ -576,6 +609,66 @@ export async function initProvider(state: LazyProviderState): Promise<void> {
     const matonConnectionsPath = process.env['EMAIL_AGENT_MCP_MATON_CONNECTIONS_PATH'];
     const matonApiKey = process.env['MATON_API_KEY'];
 
+    const nangoConnectionsRaw = process.env['EMAIL_AGENT_MCP_NANGO_OUTLOOK_CONNECTIONS'];
+    const nangoAccountsRaw = process.env['EMAIL_AGENT_MCP_NANGO_OUTLOOK_ACCOUNTS'];
+    const nangoSecretRaw = process.env['EMAIL_AGENT_MCP_NANGO_SECRET_KEY'];
+    const nangoHostRaw = process.env['EMAIL_AGENT_MCP_NANGO_HOST'];
+    const nangoEnvPresent =
+      (nangoConnectionsRaw !== undefined && nangoConnectionsRaw !== '') ||
+      (nangoAccountsRaw !== undefined && nangoAccountsRaw.trim() !== '') ||
+      (nangoHostRaw !== undefined && nangoHostRaw.trim() !== '');
+
+    let nangoConnections = new Map<string, {
+      account: string;
+      providerConfigKey: string;
+      connectionId: string;
+    }>();
+    let nangoAccounts = new Set<string>();
+    let nangoHost = 'https://api.nango.dev';
+    let nangoConfigError: Error | null = null;
+    let nangoSecretMissing = false;
+    const nangoSecretKey = nangoSecretRaw?.trim() ?? '';
+
+    if (nangoEnvPresent) {
+      const problems: Error[] = [];
+      const parsedAccounts = parseNangoOutlookAccounts(nangoAccountsRaw);
+      nangoAccounts = parsedAccounts.accounts;
+      if (parsedAccounts.invalid) {
+        problems.push(new Error('Invalid Nango Outlook accounts configuration'));
+      }
+      try {
+        nangoConnections = parseNangoOutlookConnections(nangoConnectionsRaw);
+      } catch (err) {
+        problems.push(err instanceof Error ? err : new Error(String(err)));
+      }
+      const parsedDesignated = new Set<string>([...nangoAccounts, ...nangoConnections.keys()]);
+      if (parsedDesignated.size > 0 || (nangoHostRaw !== undefined && nangoHostRaw.trim() !== '')) {
+        try {
+          nangoHost = resolveNangoHost(nangoHostRaw);
+        } catch (err) {
+          problems.push(err instanceof Error ? err : new Error(String(err)));
+        }
+      }
+      if (parsedDesignated.size > 0 && nangoSecretKey === '') {
+        nangoSecretMissing = true;
+      }
+      nangoConfigError = problems[0] ?? null;
+      if (problems.length > 0 || nangoSecretMissing) {
+        console.error(
+          '[email-agent-mcp] Nango Outlook configuration is invalid; Nango mailboxes are unavailable',
+        );
+      }
+    }
+
+    // Union of the accounts list and the parsed JSON. A designated mailbox is
+    // never built with Maton or delegated OAuth, including when setup failed.
+    const nangoDesignated = new Set<string>([...nangoAccounts, ...nangoConnections.keys()]);
+    const nangoFailureMessage = (account: string): string => {
+      if (nangoConfigError) return nangoConfigError.message;
+      if (nangoSecretMissing) return new NangoNotConfiguredError(account).message;
+      return `Nango connection is not configured for ${account}`;
+    };
+
     let matonGmailConnections = null;
     let matonGmailSetupError: Error | null = null;
     if (gmailMatonMode) {
@@ -607,7 +700,13 @@ export async function initProvider(state: LazyProviderState): Promise<void> {
         }
         matonOutlookConnections = await loadMatonOutlookConnections(
           matonConnectionsPath,
-          microsoftMailboxes.flatMap(metadata => metadata.emailAddress ? [metadata.emailAddress] : []),
+          // A stale or inactive Maton record for a Nango mailbox must not fail
+          // Maton setup for the other Outlook mailboxes.
+          microsoftMailboxes.flatMap(metadata => {
+            if (!metadata.emailAddress) return [];
+            if (nangoDesignated.has(normaliseNangoAccount(metadata.emailAddress))) return [];
+            return [metadata.emailAddress];
+          }),
         );
       } catch (err) {
         matonOutlookSetupError = err instanceof Error ? err : new Error(String(err));
@@ -617,7 +716,8 @@ export async function initProvider(state: LazyProviderState): Promise<void> {
     if (
       microsoftMailboxes.length === 0 &&
       gmailMailboxes.length === 0 &&
-      matonGmailAccounts.length === 0
+      matonGmailAccounts.length === 0 &&
+      nangoDesignated.size === 0
     ) {
       state.isDemo = true;
       state.status = 'not_configured';
@@ -629,9 +729,88 @@ export async function initProvider(state: LazyProviderState): Promise<void> {
 
     const connectedMailboxes: LazyMailboxState[] = [];
     const failedMailboxes: LazyMailboxState[] = [];
+    const handledNangoAccounts = new Set<string>();
+
+    const recordNangoMailbox = (
+      account: string,
+      name: string,
+      emailAddress: string | undefined,
+      displayName: string,
+    ): void => {
+      const connection = nangoConnections.get(account);
+      if (nangoConfigError || nangoSecretMissing || !connection || nangoSecretKey === '') {
+        const error = nangoFailureMessage(account);
+        failedMailboxes.push({
+          name,
+          emailAddress,
+          displayName,
+          providerType: 'microsoft',
+          provider: null,
+          auth: null,
+          isDefault: false,
+          status: 'error',
+          error,
+        });
+        console.error(`[email-agent-mcp] Skipping mailbox "${displayName}": ${error}`);
+        return;
+      }
+
+      try {
+        const source = new NangoTokenSource({
+          account,
+          providerConfigKey: connection.providerConfigKey,
+          connectionId: connection.connectionId,
+          secretKey: nangoSecretKey,
+          host: nangoHost,
+        });
+        const client = new RealGraphApiClient(
+          () => source.getAccessToken(),
+          () => source.forceRefresh(),
+          { deadlineMs: 90_000 },
+        );
+        const mailboxAuth: LazyProviderAuth = {
+          getTokenHealthWarning: () => source.getTokenHealthWarning(),
+          tryReconnect: () => source.forceRefresh(),
+        };
+        const provider = new GraphEmailProvider(client);
+        connectedMailboxes.push({
+          name,
+          emailAddress,
+          displayName,
+          providerType: 'microsoft',
+          provider,
+          auth: mailboxAuth,
+          isDefault: false,
+          status: 'connected',
+        });
+        console.error(`[email-agent-mcp] Connected to mailbox "${displayName}" via Nango`);
+      } catch {
+        const error = `Nango mailbox setup failed for ${account}`;
+        failedMailboxes.push({
+          name,
+          emailAddress,
+          displayName,
+          providerType: 'microsoft',
+          provider: null,
+          auth: null,
+          isDefault: false,
+          status: 'error',
+          error,
+        });
+        console.error(`[email-agent-mcp] Skipping mailbox "${displayName}": ${error}`);
+      }
+    };
 
     for (const metadata of microsoftMailboxes) {
       const displayName = metadata.emailAddress ?? metadata.mailboxName;
+      const nangoAccount = metadata.emailAddress
+        ? normaliseNangoAccount(metadata.emailAddress)
+        : undefined;
+      if (nangoAccount && nangoDesignated.has(nangoAccount)) {
+        handledNangoAccounts.add(nangoAccount);
+        recordNangoMailbox(nangoAccount, metadata.mailboxName, metadata.emailAddress, displayName);
+        continue;
+      }
       try {
         let client;
         let mailboxAuth: LazyProviderAuth;
@@ -690,6 +869,13 @@ export async function initProvider(state: LazyProviderState): Promise<void> {
           `[email-agent-mcp] Skipping mailbox "${displayName}": ${err instanceof Error ? err.message : err}`,
         );
       }
+    }
+
+    for (const account of nangoDesignated) {
+      if (handledNangoAccounts.has(account)) continue;
+      // No local metadata file (typical of a hosted dashboard). Still connect,
+      // or record the setup failure — never leave the account for another transport.
+      recordNangoMailbox(account, account, account, account);
     }
 
     for (const account of matonGmailAccounts) {

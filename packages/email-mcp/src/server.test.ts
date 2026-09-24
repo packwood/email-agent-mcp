@@ -1,4 +1,7 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { z } from 'zod';
 import { deleteEmailAction, sendEmailAction } from '@usejunior/email-core';
 import {
@@ -11,11 +14,73 @@ import {
   waitForInit,
   ensureProvider,
   buildLazyActions,
+  initProvider,
   coerceArgsForZod,
   type EmailActionDef,
   type LazyProviderState,
   type LazyMailboxState,
 } from './server.js';
+
+// Records constructor calls made while initProvider selects a transport.
+// Passthrough to the real classes so existing tests are unchanged when they
+// never import the provider. Secret and connection id are not stored.
+const nangoWiring = vi.hoisted(() => ({
+  matonConnectionIds: [] as string[],
+  realGraphOptions: [] as Array<{ deadlineMs?: number } | undefined>,
+  nango: [] as Array<{ account: string; providerConfigKey: string; host: string }>,
+  delegatedMailboxes: [] as string[],
+}));
+
+vi.mock('@usejunior/provider-microsoft', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@usejunior/provider-microsoft')>();
+
+  class TrackingMatonGraphApiClient extends actual.MatonGraphApiClient {
+    constructor(apiKey: string, connectionId: string, deadlineMs?: number) {
+      nangoWiring.matonConnectionIds.push(connectionId);
+      super(apiKey, connectionId, deadlineMs);
+    }
+  }
+
+  class TrackingRealGraphApiClient extends actual.RealGraphApiClient {
+    constructor(
+      getToken: () => Promise<string>,
+      onAuthError?: () => Promise<boolean>,
+      options?: { deadlineMs?: number },
+    ) {
+      nangoWiring.realGraphOptions.push(options);
+      super(getToken, onAuthError, options);
+    }
+  }
+
+  class TrackingNangoTokenSource extends actual.NangoTokenSource {
+    constructor(options: ConstructorParameters<typeof actual.NangoTokenSource>[0]) {
+      nangoWiring.nango.push({
+        account: options.account,
+        providerConfigKey: options.providerConfigKey,
+        host: options.host,
+      });
+      super(options);
+    }
+  }
+
+  class TrackingDelegatedAuthManager extends actual.DelegatedAuthManager {
+    constructor(
+      config: ConstructorParameters<typeof actual.DelegatedAuthManager>[0],
+      mailboxName?: string,
+    ) {
+      nangoWiring.delegatedMailboxes.push(mailboxName ?? 'default');
+      super(config, mailboxName);
+    }
+  }
+
+  return {
+    ...actual,
+    MatonGraphApiClient: TrackingMatonGraphApiClient,
+    RealGraphApiClient: TrackingRealGraphApiClient,
+    NangoTokenSource: TrackingNangoTokenSource,
+    DelegatedAuthManager: TrackingDelegatedAuthManager,
+  };
+});
 
 // Create test actions that mimic the email-core action pattern
 const testActions: EmailActionDef[] = [
@@ -2659,5 +2724,260 @@ describe('mailbox-config/Mailbox Names Are Round-Trippable Selectors', () => {
     expect(retried.error?.code).not.toBe('MAILBOX_REQUIRED');
     expect(personalCreate).toHaveBeenCalledTimes(1);
     expect(workCreate).not.toHaveBeenCalled();
+  });
+});
+
+describe('mcp-transport/Nango Outlook transport selection', () => {
+  const ENV_KEYS = [
+    'EMAIL_AGENT_MCP_HOME',
+    'EMAIL_AGENT_MCP_MICROSOFT_TRANSPORT',
+    'EMAIL_AGENT_MCP_GMAIL_TRANSPORT',
+    'EMAIL_AGENT_MCP_MATON_CONNECTIONS_PATH',
+    'EMAIL_AGENT_MCP_MATON_GMAIL_ACCOUNTS',
+    'MATON_API_KEY',
+    'EMAIL_AGENT_MCP_NANGO_OUTLOOK_CONNECTIONS',
+    'EMAIL_AGENT_MCP_NANGO_OUTLOOK_ACCOUNTS',
+    'EMAIL_AGENT_MCP_NANGO_SECRET_KEY',
+    'EMAIL_AGENT_MCP_NANGO_HOST',
+  ] as const;
+
+  let savedEnv: Array<[string, string | undefined]> = [];
+  let home = '';
+  let errorLogs: string[] = [];
+  let errorSpy: { mockRestore: () => void } | undefined;
+
+  beforeEach(async () => {
+    savedEnv = ENV_KEYS.map(key => [key, process.env[key]]);
+    for (const key of ENV_KEYS) delete process.env[key];
+    nangoWiring.matonConnectionIds.length = 0;
+    nangoWiring.realGraphOptions.length = 0;
+    nangoWiring.nango.length = 0;
+    nangoWiring.delegatedMailboxes.length = 0;
+    errorLogs = [];
+    errorSpy = vi.spyOn(console, 'error').mockImplementation((...args: unknown[]) => {
+      errorLogs.push(args.map(arg => String(arg)).join(' '));
+    });
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      throw new Error('network is not used while selecting the Nango transport');
+    }));
+    home = await mkdtemp(join(tmpdir(), 'nango-wiring-'));
+    process.env['EMAIL_AGENT_MCP_HOME'] = home;
+  });
+
+  afterEach(async () => {
+    errorSpy?.mockRestore();
+    vi.unstubAllGlobals();
+    for (const [key, value] of savedEnv) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    if (home) await rm(home, { recursive: true, force: true });
+  });
+
+  function logs(): string {
+    return errorLogs.join('\n');
+  }
+
+  async function writeMicrosoftMailbox(mailboxName: string, emailAddress: string): Promise<void> {
+    const dir = join(home, 'tokens');
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, `${mailboxName}.json`), JSON.stringify({
+      authenticationRecord: {
+        authority: 'https://login.microsoftonline.com/common',
+        homeAccountId: 'test',
+        clientId: 'client-id',
+        tenantId: 'tenant-id',
+      },
+      lastInteractiveAuthAt: '2026-01-01T00:00:00.000Z',
+      clientId: 'client-id',
+      tenantId: 'tenant-id',
+      mailboxName,
+      emailAddress,
+    }));
+  }
+
+  async function writeMatonConnections(connections: unknown[]): Promise<void> {
+    const path = join(home, 'maton-connections.json');
+    await writeFile(path, JSON.stringify({ connections }));
+    process.env['EMAIL_AGENT_MCP_MATON_CONNECTIONS_PATH'] = path;
+    process.env['EMAIL_AGENT_MCP_MICROSOFT_TRANSPORT'] = 'maton';
+    process.env['MATON_API_KEY'] = 'maton-test-key';
+  }
+
+  it('Scenario: a Nango account with Maton mode and a Maton record connects via Nango', async () => {
+    await writeMicrosoftMailbox('joshua', 'joshua@example.com');
+    await writeMicrosoftMailbox('other', 'other@example.com');
+    await writeMatonConnections([
+      { app: 'outlook', account: 'Joshua@Example.com', connection_id: 'maton-joshua', status: 'INACTIVE' },
+      { app: 'outlook', account: 'other@example.com', connection_id: 'maton-other', status: 'ACTIVE' },
+    ]);
+    process.env['EMAIL_AGENT_MCP_NANGO_OUTLOOK_CONNECTIONS'] = JSON.stringify([
+      { account: 'Joshua@Example.com', providerConfigKey: 'microsoft', connectionId: 'nango-conn-joshua' },
+    ]);
+    process.env['EMAIL_AGENT_MCP_NANGO_OUTLOOK_ACCOUNTS'] = 'Joshua@Example.com';
+    process.env['EMAIL_AGENT_MCP_NANGO_SECRET_KEY'] = 'nango-secret-key';
+
+    const state = createLazyProviderState();
+    await initProvider(state);
+
+    const joshua = state.mailboxes.find(mailbox => mailbox.emailAddress === 'joshua@example.com');
+    const other = state.mailboxes.find(mailbox => mailbox.emailAddress === 'other@example.com');
+    expect(joshua).toMatchObject({
+      name: 'joshua',
+      displayName: 'joshua@example.com',
+      providerType: 'microsoft',
+      status: 'connected',
+    });
+    expect(joshua?.provider).not.toBeNull();
+    expect(other).toMatchObject({
+      name: 'other',
+      providerType: 'microsoft',
+      status: 'connected',
+    });
+    expect(nangoWiring.matonConnectionIds).toEqual(['maton-other']);
+    expect(nangoWiring.nango).toEqual([
+      { account: 'joshua@example.com', providerConfigKey: 'microsoft', host: 'https://api.nango.dev' },
+    ]);
+    expect(nangoWiring.realGraphOptions).toEqual([{ deadlineMs: 90_000 }]);
+    expect(nangoWiring.delegatedMailboxes).toEqual([]);
+    expect(logs()).toContain('[email-agent-mcp] Connected to mailbox "joshua@example.com" via Nango');
+    expect(logs()).toContain('[email-agent-mcp] Connected to mailbox "other@example.com" via Maton');
+    expect(logs()).not.toContain('nango-secret-key');
+    expect(logs()).not.toContain('nango-conn-joshua');
+    expect(logs()).not.toContain('maton-joshua');
+    expect(vi.mocked(fetch)).not.toHaveBeenCalled();
+    expect(state.status).toBe('connected');
+    expect(state.isDemo).toBe(false);
+  });
+
+  it('Scenario: an account listed only in Nango accounts with no secret is an error, not Maton', async () => {
+    await writeMicrosoftMailbox('joshua', 'joshua@example.com');
+    await writeMatonConnections([
+      { app: 'outlook', account: 'joshua@example.com', connection_id: 'maton-joshua', status: 'ACTIVE' },
+    ]);
+    process.env['EMAIL_AGENT_MCP_NANGO_OUTLOOK_ACCOUNTS'] = 'joshua@example.com';
+    delete process.env['EMAIL_AGENT_MCP_NANGO_SECRET_KEY'];
+    delete process.env['EMAIL_AGENT_MCP_NANGO_OUTLOOK_CONNECTIONS'];
+
+    const state = createLazyProviderState();
+    await initProvider(state);
+
+    expect(state.mailboxes).toEqual([
+      expect.objectContaining({
+        name: 'joshua',
+        emailAddress: 'joshua@example.com',
+        providerType: 'microsoft',
+        status: 'error',
+        provider: null,
+        error: 'Nango is not configured for joshua@example.com (missing secret key)',
+      }),
+    ]);
+    expect(state.mailboxes.some(mailbox => mailbox.status === 'connected')).toBe(false);
+    expect(nangoWiring.matonConnectionIds).toEqual([]);
+    expect(nangoWiring.nango).toEqual([]);
+    expect(nangoWiring.realGraphOptions).toEqual([]);
+    expect(nangoWiring.delegatedMailboxes).toEqual([]);
+    expect(logs()).toContain(
+      '[email-agent-mcp] Nango Outlook configuration is invalid; Nango mailboxes are unavailable',
+    );
+    expect(logs().match(/Nango Outlook configuration is invalid/g)).toHaveLength(1);
+    expect(logs()).not.toContain('via Maton');
+    expect(logs()).not.toContain('via OAuth');
+    expect(logs()).not.toContain('via Nango');
+    expect(logs()).not.toContain('Nango is not configured for configured mailbox');
+    expect(vi.mocked(fetch)).not.toHaveBeenCalled();
+  });
+
+  it('Scenario: unparseable Nango connections still fail the accounts list closed', async () => {
+    await writeMicrosoftMailbox('joshua', 'joshua@example.com');
+    await writeMatonConnections([
+      { app: 'outlook', account: 'joshua@example.com', connection_id: 'maton-joshua', status: 'ACTIVE' },
+    ]);
+    process.env['EMAIL_AGENT_MCP_NANGO_OUTLOOK_ACCOUNTS'] = 'joshua@example.com';
+    process.env['EMAIL_AGENT_MCP_NANGO_SECRET_KEY'] = 'nango-secret-key';
+    process.env['EMAIL_AGENT_MCP_NANGO_OUTLOOK_CONNECTIONS'] =
+      '[{"account":"joshua@example.com","providerConfigKey":"microsoft","connectionId":"LEAK-CONN-ID","extra":true}]';
+
+    const state = createLazyProviderState();
+    await initProvider(state);
+
+    expect(state.mailboxes).toEqual([
+      expect.objectContaining({
+        name: 'joshua',
+        status: 'error',
+        provider: null,
+        error: 'Invalid Nango Outlook connections configuration',
+      }),
+    ]);
+    expect(nangoWiring.matonConnectionIds).toEqual([]);
+    expect(nangoWiring.delegatedMailboxes).toEqual([]);
+    expect(logs()).not.toContain('LEAK-CONN-ID');
+    expect(state.mailboxes[0]!.error).not.toContain('LEAK-CONN-ID');
+    expect(logs()).not.toContain('via Maton');
+    expect(logs()).not.toContain('via OAuth');
+    expect(vi.mocked(fetch)).not.toHaveBeenCalled();
+  });
+
+  it('Scenario: a Nango account with no metadata file is still connected', async () => {
+    process.env['EMAIL_AGENT_MCP_NANGO_OUTLOOK_CONNECTIONS'] = JSON.stringify([
+      { account: 'hosted@example.com', providerConfigKey: 'microsoft', connectionId: 'nango-conn-hosted' },
+    ]);
+    process.env['EMAIL_AGENT_MCP_NANGO_SECRET_KEY'] = 'nango-secret-key';
+
+    const state = createLazyProviderState();
+    await initProvider(state);
+
+    expect(state.status).toBe('connected');
+    expect(state.isDemo).toBe(false);
+    expect(state.mailboxes).toEqual([
+      expect.objectContaining({
+        name: 'hosted@example.com',
+        emailAddress: 'hosted@example.com',
+        displayName: 'hosted@example.com',
+        providerType: 'microsoft',
+        status: 'connected',
+        isDefault: true,
+      }),
+    ]);
+    expect(state.mailboxes[0]!.provider).not.toBeNull();
+    expect(nangoWiring.nango).toEqual([
+      { account: 'hosted@example.com', providerConfigKey: 'microsoft', host: 'https://api.nango.dev' },
+    ]);
+    expect(nangoWiring.realGraphOptions).toEqual([{ deadlineMs: 90_000 }]);
+    expect(nangoWiring.matonConnectionIds).toEqual([]);
+    expect(nangoWiring.delegatedMailboxes).toEqual([]);
+    expect(logs()).toContain('[email-agent-mcp] Connected to mailbox "hosted@example.com" via Nango');
+    expect(logs()).not.toContain('nango-secret-key');
+    expect(logs()).not.toContain('nango-conn-hosted');
+    expect(logs()).not.toContain('No configured mailboxes');
+    expect(vi.mocked(fetch)).not.toHaveBeenCalled();
+  });
+
+  it('Scenario: with no Nango env, Maton Outlook is unchanged', async () => {
+    await writeMicrosoftMailbox('other', 'other@example.com');
+    await writeMatonConnections([
+      { app: 'outlook', account: 'other@example.com', connection_id: 'maton-other', status: 'ACTIVE' },
+    ]);
+
+    const state = createLazyProviderState();
+    await initProvider(state);
+
+    expect(state.status).toBe('connected');
+    expect(state.mailboxes).toEqual([
+      expect.objectContaining({
+        name: 'other',
+        emailAddress: 'other@example.com',
+        providerType: 'microsoft',
+        status: 'connected',
+      }),
+    ]);
+    expect(nangoWiring.matonConnectionIds).toEqual(['maton-other']);
+    expect(nangoWiring.nango).toEqual([]);
+    expect(nangoWiring.realGraphOptions).toEqual([]);
+    expect(nangoWiring.delegatedMailboxes).toEqual([]);
+    expect(logs()).toContain('[email-agent-mcp] Connected to mailbox "other@example.com" via Maton');
+    expect(logs()).not.toContain('via Nango');
+    expect(logs()).not.toContain('Nango Outlook configuration is invalid');
+    expect(vi.mocked(fetch)).not.toHaveBeenCalled();
   });
 });
