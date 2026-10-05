@@ -1224,6 +1224,9 @@ export class GraphEmailProvider implements EmailReader, EmailSender, EmailSchedu
    */
   private async postDraftAttachments(draftId: string, attachments: OutboundAttachment[]): Promise<void> {
     for (const att of attachments) {
+      // Switch on encoded size, not Graph's documented 3MB raw threshold: a
+      // 2.9MB file is a ~3.9MB POST, at the 4MB request cap. Upload sessions
+      // accept smaller files too (2.5MB verified live, 2026-10-05).
       if (base64Size(att.content.length) > GRAPH_ENCODED_LIMIT) {
         await this.uploadLargeAttachment(draftId, att);
         continue;
