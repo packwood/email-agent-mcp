@@ -39,9 +39,24 @@ const SUBJECT_MAX_LENGTH = 255;
 // raw file: a fileAttachment carries the bytes as base64 (≈4/3 expansion)
 // inside JSON. Graph rejects requests past ~4MB, so the preflight measures
 // base64-encoded size and caps it at 3MB — conservative headroom for the
-// JSON envelope and (for inline sends) the message body. Files past this
-// need the upload-session flow, which is intentionally out of scope here.
+// JSON envelope and (for inline sends) the message body. Draft paths upload
+// files past this through an attachment upload session; inline /sendMail and
+// scheduled sends still refuse them.
 const GRAPH_ENCODED_LIMIT = 3 * 1024 * 1024;
+
+// Graph's ceiling for one file uploaded through an attachment upload session.
+const GRAPH_UPLOAD_SESSION_MAX_BYTES = 150 * 1024 * 1024;
+// Each PUT must stay under 4MB; Graph recommends multiples of 320KiB.
+const GRAPH_UPLOAD_CHUNK_BYTES = 12 * 320 * 1024;
+const GRAPH_UPLOAD_CHUNK_TIMEOUT_MS = 120_000;
+// The upload URL carries its own auth token, so the bytes go to Outlook
+// directly rather than through the Graph client. Only Microsoft hosts are
+// trusted with them.
+const GRAPH_UPLOAD_HOSTS = new Set([
+  'outlook.office.com',
+  'outlook.office365.com',
+  'graph.microsoft.com',
+]);
 
 /** base64-encoded byte length of a buffer of `rawBytes` bytes. */
 function base64Size(rawBytes: number): number {
@@ -79,6 +94,44 @@ function checkGraphAttachmentLimits(
     };
   }
   return null;
+}
+
+/**
+ * Preflight for the two-step draft paths (POST /attachments or an upload
+ * session per file): only Graph's per-file upload-session ceiling applies.
+ */
+function checkDraftAttachmentLimits(attachments: OutboundAttachment[] | undefined): EmailError | null {
+  for (const att of attachments ?? []) {
+    if (att.content.length > GRAPH_UPLOAD_SESSION_MAX_BYTES) {
+      return {
+        code: 'ATTACHMENT_TOO_LARGE_FOR_PROVIDER',
+        message: `Attachment "${att.filename}" is ${att.content.length} bytes; Microsoft Graph accepts at most ${GRAPH_UPLOAD_SESSION_MAX_BYTES} bytes per file.`,
+        recoverable: false,
+      };
+    }
+  }
+  return null;
+}
+
+/** True when every attachment fits one inline POST /messages request. */
+function fitsInlineDraftPayload(attachments: OutboundAttachment[] | undefined): boolean {
+  return checkGraphAttachmentLimits(attachments, { checkTotal: true }) === null;
+}
+
+function trustedUploadUrl(value: unknown): URL {
+  if (typeof value !== 'string' || value.length === 0) {
+    throw new Error('createUploadSession returned no uploadUrl');
+  }
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error('createUploadSession returned a malformed uploadUrl');
+  }
+  if (url.protocol !== 'https:' || !GRAPH_UPLOAD_HOSTS.has(url.hostname.toLowerCase())) {
+    throw new Error(`createUploadSession returned an untrusted upload host: ${url.hostname}`);
+  }
+  return url;
 }
 
 /**
@@ -430,8 +483,11 @@ export class GraphEmailProvider implements EmailReader, EmailSender, EmailSchedu
   private folderCache?: { expiresAt: number; folders: EmailFolder[] };
   private systemFolderIdsCache?: { expiresAt: number; idsByName: Map<string, string> };
 
-  constructor(client: GraphApiClient, userId = 'me') {
+  private uploadFetch: typeof fetch;
+
+  constructor(client: GraphApiClient, userId = 'me', options: { uploadFetch?: typeof fetch } = {}) {
     this.client = client;
+    this.uploadFetch = options.uploadFetch ?? ((input, init) => fetch(input, init));
     // For delegated auth, use /me/. For app-only, use /users/{id}/.
     this.basePath = userId === 'me' ? '/me' : `/users/${userId}`;
   }
@@ -926,8 +982,10 @@ export class GraphEmailProvider implements EmailReader, EmailSender, EmailSchedu
   }
 
   async createDraft(msg: ComposeMessage): Promise<DraftResult> {
-    // Attachments ride inline in the POST /messages payload — cap total size.
-    const sizeError = checkGraphAttachmentLimits(msg.attachments, { checkTotal: true });
+    // Small sets ride inline in the POST /messages payload. Anything larger is
+    // attached after creation, one request or upload session per file.
+    const inline = fitsInlineDraftPayload(msg.attachments);
+    const sizeError = checkDraftAttachmentLimits(msg.attachments);
     if (sizeError) {
       return { success: false, error: sizeError };
     }
@@ -943,11 +1001,27 @@ export class GraphEmailProvider implements EmailReader, EmailSender, EmailSchedu
         ...(msg.trackingId ? [{ id: TRACKING_PROPERTY, value: msg.trackingId }] : []),
       ],
     };
-    if (msg.attachments && msg.attachments.length > 0) {
+    if (inline && msg.attachments && msg.attachments.length > 0) {
       graphMsg.attachments = msg.attachments.map(toGraphFileAttachment);
     }
 
     const response = await this.client.post(`${this.basePath}/messages`, graphMsg);
+    if (!inline && msg.attachments && msg.attachments.length > 0) {
+      if (!response.id) throw new Error('POST /messages did not return a draft id');
+      try {
+        await this.postDraftAttachments(response.id, msg.attachments);
+      } catch (err) {
+        return {
+          success: false,
+          draftId: response.id,
+          error: {
+            code: 'ATTACHMENT_UPLOAD_FAILED',
+            message: `Draft ${response.id} was created, but attaching files failed: ${err instanceof Error ? err.message : String(err)}`,
+            recoverable: false,
+          },
+        };
+      }
+    }
     return { success: true, draftId: response.id };
   }
 
@@ -1150,9 +1224,59 @@ export class GraphEmailProvider implements EmailReader, EmailSender, EmailSchedu
    */
   private async postDraftAttachments(draftId: string, attachments: OutboundAttachment[]): Promise<void> {
     for (const att of attachments) {
+      if (base64Size(att.content.length) > GRAPH_ENCODED_LIMIT) {
+        await this.uploadLargeAttachment(draftId, att);
+        continue;
+      }
       await this.client.post(
         `${this.basePath}/messages/${encodeGraphPathId(draftId)}/attachments`,
         toGraphFileAttachment(att),
+      );
+    }
+  }
+
+  /**
+   * Attach one file too large for POST /attachments: open an upload session
+   * on the draft, then PUT the bytes in sequential ranges. A failed session is
+   * cancelled so no half-uploaded attachment is left on the draft.
+   */
+  private async uploadLargeAttachment(draftId: string, att: OutboundAttachment): Promise<void> {
+    const size = att.content.length;
+    const session = await this.client.post(
+      `${this.basePath}/messages/${encodeGraphPathId(draftId)}/attachments/createUploadSession`,
+      {
+        AttachmentItem: {
+          attachmentType: 'file',
+          name: att.filename,
+          size,
+          contentType: att.mimeType || 'application/octet-stream',
+        },
+      },
+    );
+    const uploadUrl = trustedUploadUrl(session.uploadUrl);
+    try {
+      for (let start = 0; start < size; start += GRAPH_UPLOAD_CHUNK_BYTES) {
+        const end = Math.min(start + GRAPH_UPLOAD_CHUNK_BYTES, size);
+        const response = await this.uploadFetch(uploadUrl, {
+          method: 'PUT',
+          headers: {
+            'Content-Type': 'application/octet-stream',
+            'Content-Range': `bytes ${start}-${end - 1}/${size}`,
+          },
+          body: new Uint8Array(att.content.subarray(start, end)),
+          signal: AbortSignal.timeout(GRAPH_UPLOAD_CHUNK_TIMEOUT_MS),
+        });
+        if (!response.ok) {
+          throw new GraphApiError(response.status, await response.text().catch(() => ''));
+        }
+      }
+    } catch (err) {
+      await this.uploadFetch(uploadUrl, {
+        method: 'DELETE',
+        signal: AbortSignal.timeout(GRAPH_UPLOAD_CHUNK_TIMEOUT_MS),
+      }).catch(() => undefined);
+      throw new Error(
+        `Uploading "${att.filename}" failed: ${err instanceof Error ? err.message : String(err)}`,
       );
     }
   }
@@ -1164,7 +1288,7 @@ export class GraphEmailProvider implements EmailReader, EmailSender, EmailSchedu
   ): Promise<string> {
     // Size preflight before creating the draft, so an oversize attachment
     // never leaves an orphan draft behind.
-    const sizeError = checkGraphAttachmentLimits(opts?.attachments, { checkTotal: false });
+    const sizeError = checkDraftAttachmentLimits(opts?.attachments);
     if (sizeError) {
       throw new GraphAttachmentError(sizeError);
     }
@@ -1238,7 +1362,7 @@ export class GraphEmailProvider implements EmailReader, EmailSender, EmailSchedu
    * after the PATCH, matching the reply two-step upload.
    */
   private async prepareForwardDraft(messageId: string, opts: ForwardOptions): Promise<string> {
-    const sizeError = checkGraphAttachmentLimits(opts.attachments, { checkTotal: false });
+    const sizeError = checkDraftAttachmentLimits(opts.attachments);
     if (sizeError) {
       throw new GraphAttachmentError(sizeError);
     }
@@ -1344,7 +1468,7 @@ export class GraphEmailProvider implements EmailReader, EmailSender, EmailSchedu
     // provided array replaces them — delete the existing set, then add the new
     // one. Size preflight runs first so nothing is deleted if it would fail.
     if (msg.attachments !== undefined) {
-      const sizeError = checkGraphAttachmentLimits(msg.attachments, { checkTotal: false });
+      const sizeError = checkDraftAttachmentLimits(msg.attachments);
       if (sizeError) {
         return { success: false, draftId, error: sizeError };
       }
@@ -1411,7 +1535,7 @@ export class GraphEmailProvider implements EmailReader, EmailSender, EmailSchedu
   }
 
   async addDraftAttachments(draftId: string, attachments: OutboundAttachment[]): Promise<DraftResult> {
-    const sizeError = checkGraphAttachmentLimits(attachments, { checkTotal: false });
+    const sizeError = checkDraftAttachmentLimits(attachments);
     if (sizeError) {
       return { success: false, draftId, error: sizeError };
     }
