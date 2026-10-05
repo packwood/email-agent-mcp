@@ -94,6 +94,8 @@ const MAX_SEARCH_OFFSET = 10_000;
 const SEARCH_SNAPSHOT_TTL_MS = 5 * 60 * 1000;
 const MAX_SEARCH_SNAPSHOTS = 24;
 const MAX_SEARCH_SNAPSHOT_BYTES = 8 * 1024 * 1024;
+/** Largest single JSON-RPC message accepted on stdin (see runServer). */
+export const STDIO_MAX_BUFFER_BYTES = 64 * 1024 * 1024;
 
 interface CachedSearchRow {
   id: string;
@@ -1739,7 +1741,15 @@ export async function runServer(): Promise<void> {
     }
   }) as never);
 
-  const transport = new StdioServerTransport();
+  // The SDK caps one stdio message at 10MB by default. Attachments arrive as
+  // inline base64 (25MB per file, ~47MB encoded for a 35MB draft), so an
+  // oversize request would close the transport and exit the process silently.
+  const transport = new StdioServerTransport(undefined, undefined, {
+    maxBufferSize: STDIO_MAX_BUFFER_BYTES,
+  });
+  server.onerror = (err: Error) => {
+    console.error(`[email-agent-mcp] MCP transport error: ${err.message}`);
+  };
   await server.connect(transport);
   console.error(`[email-agent-mcp] MCP server started on stdio (${tools.length} tools) — provider init deferred`);
 

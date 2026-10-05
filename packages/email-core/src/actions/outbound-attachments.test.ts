@@ -188,6 +188,30 @@ describe('outbound-attachments/send_email', () => {
     expect(parsed.success).toBe(false);
   });
 
+  it('Scenario: misplaced or excess padding is rejected', () => {
+    for (const base64 of ['A===', 'AB=C', '=AAA', 'AAAA====']) {
+      const parsed = sendEmailAction.input.safeParse({
+        to: 'alice@allowed.com',
+        subject: 'Bad',
+        body: 'body',
+        attachments: [{ base64, filename: 'x.bin' }],
+      });
+      expect(parsed.success, base64).toBe(false);
+    }
+  });
+
+  // Regression: a quartet-grouped regex overflowed V8's stack past ~5MB, so
+  // every large inline attachment failed with "Maximum call stack size exceeded".
+  it('Scenario: a 20MB base64 attachment validates', () => {
+    const parsed = sendEmailAction.input.safeParse({
+      to: 'alice@allowed.com',
+      subject: 'Big',
+      body: 'body',
+      attachments: [{ base64: Buffer.alloc(20 * 1024 * 1024 + 1, 7).toString('base64'), filename: 'big.bin' }],
+    });
+    expect(parsed.success).toBe(true);
+  });
+
   it('Scenario: an attachment with neither path nor base64 is rejected', () => {
     const parsed = sendEmailAction.input.safeParse({
       to: 'alice@allowed.com',

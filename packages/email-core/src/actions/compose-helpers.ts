@@ -146,18 +146,20 @@ export async function resolveComposeFields(
 
 // --- Outbound attachments ---
 
-// Strict standard-base64: zero or more full quartets, then an optional final
-// group of 2 chars + `==` or 3 chars + `=`. Rejects lengths that are not a
-// valid base64 size (e.g. a lone `A` or `abcde`), which Node's decoder would
-// otherwise silently truncate into corrupt bytes.
-const BASE64_PATTERN = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
+// Strict standard-base64: the base64 alphabet, at most two trailing `=`, and a
+// length that is a multiple of 4. Rejects lengths that are not a valid base64
+// size (e.g. a lone `A` or `abcde`), which Node's decoder would otherwise
+// silently truncate into corrupt bytes. The length is checked separately
+// because a quartet-grouped regex (`(?:[...]{4})*`) overflows V8's regex
+// stack on inputs past ~5MB.
+const BASE64_PATTERN = /^[A-Za-z0-9+/]*={0,2}$/;
 
 const hasNonEmpty = (v: string | undefined): boolean => v !== undefined && v !== '';
 
 /** True when `value` (whitespace stripped) is non-empty, valid standard base64. */
 function isValidBase64(value: string): boolean {
   const stripped = value.replace(/\s/g, '');
-  return stripped.length > 0 && BASE64_PATTERN.test(stripped);
+  return stripped.length > 0 && stripped.length % 4 === 0 && BASE64_PATTERN.test(stripped);
 }
 
 /**

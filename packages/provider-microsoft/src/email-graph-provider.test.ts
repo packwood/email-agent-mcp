@@ -3077,6 +3077,155 @@ describe('provider-microsoft/Outbound Attachments', () => {
   });
 });
 
+describe('provider-microsoft/Large Attachment Upload Sessions', () => {
+  type MockFn = ReturnType<typeof vi.fn>;
+  const CHUNK = 12 * 320 * 1024;
+  const UPLOAD_URL = 'https://outlook.office.com/api/v2.0/me/messages/d1/AttachmentSessions/s1?authtoken=x';
+
+  function sessionClient(uploadUrl = UPLOAD_URL): GraphApiClient {
+    return createMockClient({
+      get: vi.fn().mockResolvedValue({ value: [] }),
+      post: vi.fn().mockImplementation(async (url: string) => {
+        if (url.endsWith('/createUploadSession')) return { uploadUrl };
+        if (url.endsWith('/messages')) return { id: 'draft-1' };
+        return { id: 'att-1' };
+      }),
+    });
+  }
+
+  function okFetch(): MockFn {
+    return vi.fn().mockResolvedValue(new Response(null, { status: 200 }));
+  }
+
+  it('createDraft with a file over 3MB creates the draft bare, then uploads in ranged PUTs', async () => {
+    const client = sessionClient();
+    const uploadFetch = okFetch();
+    const provider = new GraphEmailProvider(client, 'me', { uploadFetch: uploadFetch as unknown as typeof fetch });
+    const big = Buffer.alloc(8_000_000, 7);
+
+    const result = await provider.createDraft({
+      to: [{ email: 'bob@corp.com' }],
+      subject: 'Big',
+      body: 'body',
+      attachments: [{ filename: 'Appraisal (v2).pdf', content: big, mimeType: 'application/pdf' }],
+    });
+
+    expect(result).toEqual({ success: true, draftId: 'draft-1' });
+    const posts = (client.post as MockFn).mock.calls;
+    const created = posts.find(c => String(c[0]).endsWith('/messages'))!;
+    expect((created[1] as Record<string, unknown>).attachments).toBeUndefined();
+    const session = posts.find(c => String(c[0]).endsWith('/createUploadSession'))!;
+    expect(session[0]).toBe('/me/messages/draft-1/attachments/createUploadSession');
+    expect(session[1]).toEqual({
+      AttachmentItem: { attachmentType: 'file', name: 'Appraisal (v2).pdf', size: 8_000_000, contentType: 'application/pdf' },
+    });
+    expect(posts.some(c => String(c[0]).endsWith('/attachments'))).toBe(false);
+
+    const puts = uploadFetch.mock.calls;
+    expect(puts).toHaveLength(Math.ceil(8_000_000 / CHUNK));
+    let next = 0;
+    for (const [url, init] of puts) {
+      expect(String(url)).toBe(UPLOAD_URL);
+      expect(init.method).toBe('PUT');
+      expect(init.headers.Authorization).toBeUndefined();
+      const body = init.body as Uint8Array;
+      expect(body.length).toBeLessThanOrEqual(CHUNK);
+      expect(init.headers['Content-Range']).toBe(`bytes ${next}-${next + body.length - 1}/8000000`);
+      next += body.length;
+    }
+    expect(next).toBe(8_000_000);
+  });
+
+  it('createDraft whose small files exceed the inline total posts each file after creation', async () => {
+    const client = sessionClient();
+    const uploadFetch = okFetch();
+    const provider = new GraphEmailProvider(client, 'me', { uploadFetch: uploadFetch as unknown as typeof fetch });
+    const two = Buffer.alloc(2_000_000, 1);
+
+    const result = await provider.createDraft({
+      to: [{ email: 'bob@corp.com' }],
+      subject: 'Two',
+      body: 'body',
+      attachments: [
+        { filename: 'a.pdf', content: two, mimeType: 'application/pdf' },
+        { filename: 'b.pdf', content: two, mimeType: 'application/pdf' },
+      ],
+    });
+
+    expect(result.success).toBe(true);
+    const attCalls = (client.post as MockFn).mock.calls.filter(c => String(c[0]).endsWith('/draft-1/attachments'));
+    expect(attCalls.map(c => (c[1] as { name: string }).name)).toEqual(['a.pdf', 'b.pdf']);
+    expect(uploadFetch).not.toHaveBeenCalled();
+  });
+
+  it('updateDraft replaces attachments using an upload session for a large file', async () => {
+    const client = sessionClient();
+    const uploadFetch = okFetch();
+    const provider = new GraphEmailProvider(client, 'me', { uploadFetch: uploadFetch as unknown as typeof fetch });
+
+    const result = await provider.updateDraft('draft-1', {
+      attachments: [{ filename: 'big.bin', content: Buffer.alloc(5_000_000), mimeType: 'application/octet-stream' }],
+    });
+
+    expect(result.success).toBe(true);
+    expect((client.post as MockFn).mock.calls.some(c => String(c[0]).endsWith('/createUploadSession'))).toBe(true);
+    expect(uploadFetch).toHaveBeenCalledTimes(2);
+  });
+
+  it('refuses an upload URL on a non-Microsoft host without sending bytes', async () => {
+    const client = sessionClient('https://evil.example.com/upload');
+    const uploadFetch = okFetch();
+    const provider = new GraphEmailProvider(client, 'me', { uploadFetch: uploadFetch as unknown as typeof fetch });
+
+    const result = await provider.createDraft({
+      to: [{ email: 'bob@corp.com' }],
+      subject: 'Big',
+      body: 'body',
+      attachments: [{ filename: 'big.bin', content: Buffer.alloc(4_000_000), mimeType: 'application/octet-stream' }],
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.draftId).toBe('draft-1');
+    expect(result.error?.code).toBe('ATTACHMENT_UPLOAD_FAILED');
+    expect(result.error?.message).toContain('untrusted upload host');
+    expect(uploadFetch).not.toHaveBeenCalled();
+  });
+
+  it('cancels the upload session when a chunk PUT fails', async () => {
+    const client = sessionClient();
+    const uploadFetch = vi.fn()
+      .mockResolvedValueOnce(new Response(null, { status: 200 }))
+      .mockResolvedValueOnce(new Response('quota', { status: 507 }))
+      .mockResolvedValue(new Response(null, { status: 204 }));
+    const provider = new GraphEmailProvider(client, 'me', { uploadFetch: uploadFetch as unknown as typeof fetch });
+
+    const result = await provider.updateDraft('draft-1', {
+      attachments: [{ filename: 'big.bin', content: Buffer.alloc(9_000_000), mimeType: 'application/octet-stream' }],
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.error?.code).toBe('ATTACHMENT_UPDATE_FAILED');
+    expect(result.error?.message).toContain('big.bin');
+    expect(uploadFetch).toHaveBeenCalledTimes(3);
+    expect(uploadFetch.mock.calls[2]![1].method).toBe('DELETE');
+  });
+
+  it('inline sendMessage still refuses a file over 3MB', async () => {
+    const client = sessionClient();
+    const provider = new GraphEmailProvider(client);
+
+    const result = await provider.sendMessage({
+      to: [{ email: 'bob@corp.com' }],
+      subject: 'Big',
+      body: 'body',
+      attachments: [{ filename: 'big.bin', content: Buffer.alloc(4_000_000), mimeType: 'application/octet-stream' }],
+    });
+
+    expect(result.error?.code).toBe('ATTACHMENT_TOO_LARGE_FOR_PROVIDER');
+    expect(client.post).not.toHaveBeenCalled();
+  });
+});
+
 describe('provider-microsoft/Draft Attachment Mutations', () => {
   const PDF = Buffer.from('%PDF-1.4\nbytes', 'utf-8');
   type MockFn = ReturnType<typeof vi.fn>;
@@ -3111,7 +3260,7 @@ describe('provider-microsoft/Draft Attachment Mutations', () => {
 
     const result = await provider.addDraftAttachments('draft-1', [{
       filename: 'big.bin',
-      content: Buffer.alloc(3 * 1024 * 1024 + 1),
+      content: Buffer.alloc(150 * 1024 * 1024 + 1),
       mimeType: 'application/octet-stream',
     }]);
 
